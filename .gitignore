@@ -1,7 +1,7 @@
-# Data files — confidential, never commit
-*.xlsx
-*.xls
-*.csv
+# Data files — repo is private, Excel files are committed intentionally
+# *.xlsx
+# *.xls
+# *.csv
 
 # Python
 __pycache__/
