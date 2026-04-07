@@ -18,7 +18,9 @@ from io import BytesIO
 from pathlib import Path
 import warnings
 
-warnings.filterwarnings("ignore")
+# Only suppress matplotlib/font warnings — preserve all data-related warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+warnings.filterwarnings("ignore", message=".*Glyph.*missing.*")
 
 # ═══════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -37,8 +39,9 @@ ORIG_FILE_SHEET = "Sheet2"
 AG_PRICE_USD_OZ  = 72.00
 PB_PRICE_USD_T   = 2_000.00
 ZN_PRICE_USD_T   = 2_800.00   # LME Zinc reference
-AG_DEDUCT_OZ     = 1.5
+AG_DEDUCT_OZ     = 1.5          # Contract term — not used in delta calc (cancels out)
 PB_DEDUCT_UNITS  = 3.0
+PB_MIN_PAYABLE   = 10.0         # Contract: Pb only payable if assay > 10 %
 PAYABLE_FRACTION = 0.95
 OZ_PER_GRAM      = 1 / 31.1035
 
@@ -189,8 +192,10 @@ def load_data(new_file_bytes=None, orig_file_bytes=None):
                         vals = grp[elem].dropna()
                         if len(vals):
                             sside_lookup[tr_orig][elem] = round(float(vals.mean()), 3)
-    except Exception:
-        pass  # original file unavailable; weights and S-Side will be NaN
+    except Exception as exc:
+        import logging
+        logging.warning("Original file (weights/S-Side) could not be loaded: %s", exc)
+        # Weights and S-Side will be NaN — assay analysis still proceeds
 
     # ── Build one row per lot ──────────────────────────────────────────
     records = []
@@ -255,7 +260,8 @@ def paired_stats(p_vals, s_vals):
         w_stat, w_pval = np.nan, np.nan
 
     n_pos     = int(np.sum(d > 0))
-    sign_pval = sp_stats.binomtest(n_pos, n, 0.5).pvalue
+    n_nonzero = int(np.sum(d != 0))       # exclude ties from sign test denominator
+    sign_pval = sp_stats.binomtest(n_pos, n_nonzero, 0.5).pvalue if n_nonzero > 0 else np.nan
     cohen_d   = mean_d / std_d if std_d > 0 else np.nan
 
     p_mean    = np.mean(p)
@@ -357,14 +363,16 @@ def compute_financials(comp, ag_price, pb_price, zn_price=ZN_PRICE_USD_T):
                             extra_oz * ag_price * dmt, 2)
                     elif short == "Pb" and pd.notna(dmt):
                         avg = (pv + sv) / 2
-                        if avg > PB_DEDUCT_UNITS + 7:   # net payable only if > 10 %
+                        if avg > PB_MIN_PAYABLE:         # contract: Pb only payable if > 10 %
                             extra_frac = inflation / 100 * PAYABLE_FRACTION
                             fr[f"{stage_lbl}_Overpay_{short}"] = round(
                                 extra_frac * pb_price * dmt, 2)
                         else:
                             fr[f"{stage_lbl}_Overpay_{short}"] = 0.0
                     elif short == "Zn" and pd.notna(dmt):
-                        # Zn payable: deduct 8 units, pay 85% of balance (typical Zn terms)
+                        # WARNING: Zn terms below are ASSUMED (typical industry),
+                        # NOT from Contract 2601982-P.  Replace with actual Zn
+                        # contract terms before using in court / formal report.
                         avg = (pv + sv) / 2
                         if avg > 8.0:
                             extra_frac = inflation / 100 * 0.85
@@ -769,7 +777,7 @@ def chart_financials(fin_df, ag_price, pb_price):
 
     ax1.bar(x, vals, 0.55, color=colors, alpha=0.8, zorder=3)
     ax1.axhline(0, color="black", lw=0.5, zorder=2)
-    ax1.set_title("Estimated overpayment per lot  (Prepared stage assays)", pad=6)
+    ax1.set_title("Estimated overpayment per lot  (most advanced stage available)", pad=6)
     ax1.set_ylabel("USD")
     ax1.yaxis.set_major_formatter(mticker.FuncFormatter(
         lambda v, _: f"${v:,.0f}"))
@@ -1900,8 +1908,8 @@ with tabs[0]:
         return ""
 
     st.dataframe(
-        cdf.style.applymap(_color_completeness,
-                           subset=[c for c in cdf.columns if c not in ("TR","Contract")]),
+        cdf.style.map(_color_completeness,
+                      subset=[c for c in cdf.columns if c not in ("TR","Contract")]),
         use_container_width=True, hide_index=True,
     )
 
@@ -2069,8 +2077,10 @@ with tabs[6]:
 # ── TAB 7: Financial Impact ───────────────────────────────────────────
 with tabs[7]:
     st.caption(
-        "Overpayment is calculated from **Prepared-stage** assays (the contractually "
-        "determinative stage for most lots). Formula: inflation = (Sinchi − Penfold) / 2, "
+        "Overpayment is calculated from the **most advanced stage available** per lot "
+        "(UK finals if present, otherwise Prepared, otherwise Natural). "
+        "The Settlement\\_Stage column in the table below shows which stage was used. "
+        "Formula: inflation = (Sinchi − Penfold) / 2, "
         "then applied to payable Ag/Pb formulae per the contract."
     )
     fig_fin = chart_financials(fin_df, ag_price, pb_price)
