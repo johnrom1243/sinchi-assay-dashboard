@@ -57,6 +57,48 @@ ELEMENTS = ["Ag g", "Pb %", "As %", "Sb %", "Sn %", "Bi %", "Zn %"]
 PAYABLES  = ["Ag g", "Pb %"]
 PENALTIES = ["As %", "Sb %", "Sn %", "Bi %"]
 
+# Lab name normalization — applied to BOTH data sources before any logic.
+# Keys are lowercase; values are the canonical name used everywhere.
+LAB_NORM = {
+    # Sinchi natural lab variants
+    "savantaa":       "SavantAA",
+    "savanta":        "SavantAA",
+    "savant":         "SavantAA",
+    "flores-savanta": "SavantAA",
+    # Sinchi prepared lab variants
+    "conde":          "Conde",
+    "conde morales":  "Conde",
+    # Penfold natural lab variants
+    "spectraa":       "SpectrAA",
+    "spectra":        "SpectrAA",
+    # Penfold prepared lab variants
+    "castro":         "Castro",
+    "casto":          "Castro",           # typo in TR67705
+    # UK labs
+    "ahk uk":         "AHK UK",
+    "ahk":            "AHK UK",
+    "asi uk":         "ASI UK",
+    "asi":            "ASI UK",
+    "asa uk":         "ASI UK",           # old name variant
+    "asa":            "ASI UK",           # old name (Alex Stewart Assayers)
+    # Bolivia internal / other
+    "ahk bo":         "AHK_BO",
+    "ahkbo":          "AHK_BO",
+    "ahk pe":         "AHK_PE",
+    "niton":          "Niton",
+    "sgs":            "SGS",
+    "flores":         "Flores",
+}
+
+
+def normalize_lab(lab_value):
+    """Map any lab name variant to its canonical form."""
+    if pd.isna(lab_value):
+        return lab_value
+    key = str(lab_value).strip().lower()
+    return LAB_NORM.get(key, str(lab_value).strip())
+
+
 # Maps new file's Stage value → comp column category prefix
 STAGE_KEY_MAP = {"Natural": "Natural", "Prepared": "Prepared", "UK_Final": "UK"}
 
@@ -172,6 +214,9 @@ def load_data(new_file_bytes=None, orig_file_bytes=None):
         "As_pct": "As %", "Sb_pct": "Sb %", "Sn_pct": "Sn %",
         "Bi_pct": "Bi %", "Cu": "Cu %",
     })
+    # Normalize lab names (handles "Conde Morales", "Savanta", "ASA UK", etc.)
+    if "Lab" in assay_df.columns:
+        assay_df["Lab"] = assay_df["Lab"].map(normalize_lab)
     # Category key = "{stage_prefix}_{Ownership}"
     assay_df["_cat"] = assay_df.apply(
         lambda r: f"{STAGE_KEY_MAP.get(r['Stage'], r['Stage'])}_{r['Ownership']}",
@@ -195,7 +240,7 @@ def load_data(new_file_bytes=None, orig_file_bytes=None):
             orig = orig_raw.copy()
             orig["_tr"]   = orig["TR"].astype(str).str.strip()
             orig["_desc"] = orig["Description"].fillna("").str.strip().str.lower()
-            orig["_lab"]  = orig["Lab"].astype(str).str.strip()
+            orig["_lab"]  = orig["Lab"].map(normalize_lab)
 
             # DMT from FINAL-P rows — use LAST row per TR (most recently settled weight)
             fp = orig[orig["_lab"] == "FINAL-P"][["_tr", "DMT"]].dropna(subset=["DMT"])
