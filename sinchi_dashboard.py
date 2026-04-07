@@ -1058,6 +1058,134 @@ def chart_heatmap(comp, labels, stage_idx=2, pct_mode=False):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# CHART: COMPACT ALL-STAGES HEATMAP  (Ag & Pb × 3 stages, all lots)
+# ═══════════════════════════════════════════════════════════════════════
+def chart_compact_heatmap(comp, labels):
+    """
+    Compact heatmap: rows = lots, columns = Ag & Pb at each stage.
+    Shows the red pattern at a glance — Sinchi consistently higher at
+    Bolivia level, mixed at UK.
+    """
+    col_defs = [
+        ("Ag\nNatural",  "Natural_Penfold",  "Natural_Sinchi",  "Ag g"),
+        ("Ag\nPrepared", "Prepared_Penfold", "Prepared_Sinchi", "Ag g"),
+        ("Ag\nUK",       "UK_Penfold",       "UK_Sinchi",       "Ag g"),
+        ("Pb\nNatural",  "Natural_Penfold",  "Natural_Sinchi",  "Pb %"),
+        ("Pb\nPrepared", "Prepared_Penfold", "Prepared_Sinchi", "Pb %"),
+        ("Pb\nUK",       "UK_Penfold",       "UK_Sinchi",       "Pb %"),
+    ]
+    n_lots = len(labels)
+    n_cols = len(col_defs)
+    data = np.full((n_lots, n_cols), np.nan)
+
+    for i, (_, row) in enumerate(comp.iterrows()):
+        for j, (_, pk, sk, elem) in enumerate(col_defs):
+            pv = row.get(f"{pk}_{elem}", np.nan)
+            sv = row.get(f"{sk}_{elem}", np.nan)
+            if pd.notna(pv) and pd.notna(sv) and pv != 0:
+                data[i, j] = (sv - pv) / abs(pv) * 100   # always % relative
+
+    fig, ax = plt.subplots(figsize=(8, max(4, n_lots * 0.32 + 1)))
+    vmax = np.nanmax(np.abs(data)) if not np.all(np.isnan(data)) else 1
+    im = ax.imshow(data, aspect="auto", cmap="RdBu_r",
+                   vmin=-vmax, vmax=vmax, interpolation="nearest")
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_xticklabels([c[0] for c in col_defs], fontsize=8)
+    ax.set_yticks(np.arange(n_lots))
+    ax.set_yticklabels(safe_labels(labels), fontsize=7.5)
+
+    # Stage separator lines
+    ax.axvline(2.5, color="black", lw=1.5, alpha=0.4)
+
+    for i in range(n_lots):
+        for j in range(n_cols):
+            v = data[i, j]
+            if pd.notna(v):
+                fmt = f"{v:+.1f}" if abs(v) >= 1 else f"{v:+.2f}"
+                ax.text(j, i, fmt, ha="center", va="center", fontsize=5.5,
+                        color="white" if abs(v) > vmax * 0.5 else "black")
+
+    cb = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.03)
+    cb.set_label("% Δ relative to Penfold", fontsize=8)
+    ax.set_title(
+        "All lots × all stages — % relative delta (Sinchi − Penfold)\n"
+        "Red = Sinchi higher (benefits Sinchi)  ·  Blue = Penfold higher",
+        fontsize=10, pad=8)
+    fig.tight_layout()
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CHART: IMPACT HEATMAP  (delta × DMT for UK finals)
+# ═══════════════════════════════════════════════════════════════════════
+def chart_impact_heatmap(comp, labels):
+    """
+    Heatmap where cell colour = delta × DMT at UK finals.
+    Makes the point: even if most lots are blue (Penfold higher),
+    the few red lots are so large they dominate the total impact.
+    """
+    elems = [("Ag g", "g·t"), ("Pb %", "%·t")]
+    pk_keys = ["UK_Penfold", "UK_Sinchi"]
+    n_lots = len(labels)
+
+    data = np.full((n_lots, len(elems)), np.nan)
+    annot = np.full((n_lots, len(elems)), "", dtype=object)
+
+    for i, (_, row) in enumerate(comp.iterrows()):
+        dmt = row.get("DMT", np.nan)
+        for j, (elem, unit) in enumerate(elems):
+            pv = row.get(f"UK_Penfold_{elem}", np.nan)
+            sv = row.get(f"UK_Sinchi_{elem}", np.nan)
+            if pd.notna(pv) and pd.notna(sv) and pd.notna(dmt):
+                delta = sv - pv
+                impact = delta * float(dmt)
+                data[i, j] = impact
+                annot[i, j] = f"{impact:+,.0f}"
+
+    fig, ax = plt.subplots(figsize=(5, max(4, n_lots * 0.32 + 1)))
+    vmax = np.nanmax(np.abs(data)) if not np.all(np.isnan(data)) else 1
+    im = ax.imshow(data, aspect="auto", cmap="RdBu_r",
+                   vmin=-vmax, vmax=vmax, interpolation="nearest")
+    ax.set_xticks(np.arange(len(elems)))
+    ax.set_xticklabels(["Ag impact\n(g·t)", "Pb impact\n(%·t)"], fontsize=9)
+    ax.set_yticks(np.arange(n_lots))
+
+    # Labels with DMT
+    dmt_vals = comp["DMT"].values if "DMT" in comp.columns else [np.nan]*n_lots
+    ylabels = [f"{lbl}  ({dmt:.0f} t)" if pd.notna(dmt) else lbl
+               for lbl, dmt in zip(labels, dmt_vals)]
+    ax.set_yticklabels(ylabels, fontsize=7.5)
+
+    for i in range(n_lots):
+        for j in range(len(elems)):
+            txt = annot[i, j]
+            if txt:
+                v = data[i, j]
+                text_color = "white" if abs(v) > vmax * 0.45 else "black"
+                ax.text(j, i, txt, ha="center", va="center",
+                        fontsize=7.5, color=text_color, fontweight="bold")
+
+    cb = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.03)
+    cb.set_label("Δ × DMT  (red = Sinchi inflates)", fontsize=8)
+    ax.set_title(
+        "UK finals — impact heatmap (delta × DMT)\n"
+        "Few large red cells dominate even if most are blue",
+        fontsize=10, pad=8)
+
+    # Net totals below
+    ag_total = np.nansum(data[:, 0])
+    pb_total = np.nansum(data[:, 1])
+    ax.text(0.5, -0.08,
+            f"Net Ag: {ag_total:+,.0f} g·t    Net Pb: {pb_total:+,.2f} %·t",
+            transform=ax.transAxes, fontsize=9, ha="center",
+            fontweight="bold",
+            color=C_SINCHI if ag_total > 0 else C_PENFOLD)
+
+    fig.tight_layout()
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # CHART: BOX PLOTS
 # ═══════════════════════════════════════════════════════════════════════
 def chart_boxplots(comp, elem_col, unit, pct_mode=False):
@@ -2061,7 +2189,19 @@ with tabs[0]:
     add_download(fig_sum, "summary_bars")
     plt.close(fig_sum)
 
-    st.subheader("Delta heatmap — UK finals")
+    st.subheader("Complete delta heatmap — all lots × all stages")
+    st.markdown(
+        "Each cell = % relative delta (Sinchi − Penfold) / |Penfold|.  \n"
+        "**Left half** = Silver (Ag). **Right half** = Lead (Pb).  \n"
+        "The red wall at the Bolivia stages (Natural, Prepared) that turns "
+        "blue/neutral at UK is the smoking gun."
+    )
+    fig_ch = chart_compact_heatmap(comp, labels)
+    st.pyplot(fig_ch, use_container_width=True)
+    add_download(fig_ch, "compact_heatmap_all")
+    plt.close(fig_ch)
+
+    st.subheader("Delta heatmap — UK finals (all elements)")
     fig_hm = chart_heatmap(comp, labels, stage_idx=2, pct_mode=pct_delta)
     st.pyplot(fig_hm, use_container_width=True)
     add_download(fig_hm, "heatmap_uk")
@@ -2777,6 +2917,19 @@ with tabs[11]:
         "(contract averages the two chains). The full value is shown here "
         "so you can compare lots on equal footing."
     )
+
+    st.subheader("Impact heatmap — who benefits at each lot?")
+    st.markdown(
+        "Most lots are blue (Penfold higher at UK), but the **few red lots are "
+        "disproportionately large** — high delta combined with high tonnage. "
+        "The net totals at the bottom show who benefits overall."
+    )
+    fig_ihm = chart_impact_heatmap(comp, labels)
+    st.pyplot(fig_ihm, use_container_width=True)
+    add_download(fig_ihm, "impact_heatmap")
+    plt.close(fig_ihm)
+
+    st.markdown("---")
 
     # Build working table — Pb/Ag lots with UK finals and DMT
     imp = comp[comp["Lot_Type"] == "Pb/Ag"].copy()
