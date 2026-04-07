@@ -28,6 +28,7 @@ warnings.filterwarnings("ignore", message=".*Glyph.*missing.*")
 
 # Primary assay source — new structured file (Ownership & Stage explicit)
 NEW_FILE_PATH  = r"C:\claude\SMPY\Assay Exchanges - Low Silver Sinchi 1.xlsx"
+NEW_FILE_LOCAL = "Assay Exchanges - Low Silver Sinchi 1.xlsx"   # same-dir copy
 NEW_FILE_SHEET = "Sheet1"
 
 # Original file — used ONLY for DMT weights and S-Side results
@@ -111,13 +112,27 @@ set_chart_style()
 # ═══════════════════════════════════════════════════════════════════════
 # DATA LOADING
 # ═══════════════════════════════════════════════════════════════════════
+def _find_new_file():
+    """Return the assay file path, preferring same-directory copy."""
+    for p in [NEW_FILE_LOCAL, NEW_FILE_PATH]:
+        if Path(p).exists():
+            try:
+                with open(p, "rb") as fh:
+                    fh.read(4)
+                return p
+            except (PermissionError, OSError):
+                continue
+    return None
+
+
 def _find_orig_file():
     """
     Return the first path that both exists AND is readable.
     Tries the local SMPY copy before OneDrive to avoid permission issues
     when OneDrive has the file locked or access is denied.
     """
-    for p in [ORIG_FILE_LOCAL, ORIG_FILE_PATH]:   # local first
+    for p in [ORIG_FILE_LOCAL, "sinchi metals assays over time.xlsx",
+              ORIG_FILE_PATH]:   # local first
         if Path(p).exists():
             try:
                 with open(p, "rb") as fh:
@@ -143,7 +158,13 @@ def load_data(new_file_bytes=None, orig_file_bytes=None):
     if new_file_bytes is not None:
         assay_raw = pd.read_excel(BytesIO(new_file_bytes), sheet_name=NEW_FILE_SHEET)
     else:
-        assay_raw = pd.read_excel(NEW_FILE_PATH, sheet_name=NEW_FILE_SHEET)
+        new_path = _find_new_file()
+        if new_path is None:
+            raise FileNotFoundError(
+                f"Assay file not found. Expected at: {NEW_FILE_PATH}\n"
+                f"Or in the same directory as sinchi_dashboard.py: {NEW_FILE_LOCAL}"
+            )
+        assay_raw = pd.read_excel(new_path, sheet_name=NEW_FILE_SHEET)
 
     assay_df = assay_raw.dropna(subset=["TR_Number"]).copy()
     assay_df = assay_df.rename(columns={
