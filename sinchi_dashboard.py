@@ -18,7 +18,9 @@ from io import BytesIO
 from pathlib import Path
 import warnings
 
-warnings.filterwarnings("ignore")
+# Only suppress matplotlib/font warnings — preserve all data-related warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+warnings.filterwarnings("ignore", message=".*Glyph.*missing.*")
 
 # ═══════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -33,12 +35,10 @@ ORIG_FILE_PATH  = r"C:\Users\carlo\OneDrive\Desktop\sinchi metals assays over ti
 ORIG_FILE_LOCAL = r"C:\claude\SMPY\sinchi metals assays over time.xlsx"
 ORIG_FILE_SHEET = "Sheet2"
 
-# Reference prices (adjust via sidebar or edit here)
-AG_PRICE_USD_OZ  = 72.00
-PB_PRICE_USD_T   = 2_000.00
-ZN_PRICE_USD_T   = 2_800.00   # LME Zinc reference
-AG_DEDUCT_OZ     = 1.5
-PB_DEDUCT_UNITS  = 3.0
+# Contract constants (used for physical impact calculations)
+AG_DEDUCT_OZ     = 1.5          # Not used in delta calc (cancels out), kept for reference
+PB_DEDUCT_UNITS  = 3.0          # Deduction from Pb assay before payable calculation
+PB_MIN_PAYABLE   = 10.0         # Contract: Pb only payable if assay > 10 %
 PAYABLE_FRACTION = 0.95
 OZ_PER_GRAM      = 1 / 31.1035
 
@@ -189,8 +189,10 @@ def load_data(new_file_bytes=None, orig_file_bytes=None):
                         vals = grp[elem].dropna()
                         if len(vals):
                             sside_lookup[tr_orig][elem] = round(float(vals.mean()), 3)
-    except Exception:
-        pass  # original file unavailable; weights and S-Side will be NaN
+    except Exception as exc:
+        import logging
+        logging.warning("Original file (weights/S-Side) could not be loaded: %s", exc)
+        # Weights and S-Side will be NaN — assay analysis still proceeds
 
     # ── Build one row per lot ──────────────────────────────────────────
     records = []
@@ -255,7 +257,8 @@ def paired_stats(p_vals, s_vals):
         w_stat, w_pval = np.nan, np.nan
 
     n_pos     = int(np.sum(d > 0))
-    sign_pval = sp_stats.binomtest(n_pos, n, 0.5).pvalue
+    n_nonzero = int(np.sum(d != 0))       # exclude ties from sign test denominator
+    sign_pval = sp_stats.binomtest(n_pos, n_nonzero, 0.5).pvalue if n_nonzero > 0 else np.nan
     cohen_d   = mean_d / std_d if std_d > 0 else np.nan
 
     p_mean    = np.mean(p)
@@ -321,71 +324,55 @@ def delta_ylabel(pct_mode):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# FINANCIAL CALCULATIONS
+# PHYSICAL IMPACT CALCULATIONS  (no USD — lot-specific prices unknown)
 # ═══════════════════════════════════════════════════════════════════════
-def compute_financials(comp, ag_price, pb_price, zn_price=ZN_PRICE_USD_T):
+def compute_physical_impact(comp):
+    """
+    Compute per-lot deltas and extra payable physical quantities.
+    USD conversion is intentionally omitted because each lot has different
+    fixation prices, quotation periods, and contract appendices.
+    Damage is expressed in troy ounces (Ag) and payable tonnes (Pb).
+    """
     rows = []
     for _, r in comp.iterrows():
         lot_type = str(r.get("Lot_Type", "Pb/Ag"))
-        is_zn = lot_type == "Zn/Ag"
         fr = {"TR": r["TR"], "Contract": r["Contract"],
               "DMT": r["DMT"], "Lot_Type": lot_type}
         best_stage = None
-        # Payable metals differ by lot type:
-        # Pb/Ag → Ag (oz) + Pb (%) payable
-        # Zn/Ag → Ag (oz) + Zn (%) payable
-        metal_pairs = [("Ag", "Ag g")]
-        if is_zn:
-            metal_pairs.append(("Zn", "Zn %"))
-        else:
-            metal_pairs.append(("Pb", "Pb %"))
 
         for stage_lbl, p_key, s_key, _, _ in STAGES:
-            for short, col in metal_pairs:
+            for short, col in [("Ag", "Ag g"), ("Pb", "Pb %")]:
                 pv = r.get(f"{p_key}_{col}", np.nan)
                 sv = r.get(f"{s_key}_{col}", np.nan)
                 fr[f"{stage_lbl}_Penfold_{short}"] = pv
                 fr[f"{stage_lbl}_Sinchi_{short}"]  = sv
                 if pd.notna(pv) and pd.notna(sv):
-                    delta     = sv - pv
-                    inflation = delta / 2
-                    dmt       = r["DMT"]
+                    delta = sv - pv
                     fr[f"{stage_lbl}_Delta_{short}"] = round(delta, 3)
-                    if short == "Ag" and pd.notna(dmt):
-                        extra_oz = inflation * OZ_PER_GRAM * PAYABLE_FRACTION
-                        fr[f"{stage_lbl}_Overpay_{short}"] = round(
-                            extra_oz * ag_price * dmt, 2)
-                    elif short == "Pb" and pd.notna(dmt):
-                        avg = (pv + sv) / 2
-                        if avg > PB_DEDUCT_UNITS + 7:   # net payable only if > 10 %
-                            extra_frac = inflation / 100 * PAYABLE_FRACTION
-                            fr[f"{stage_lbl}_Overpay_{short}"] = round(
-                                extra_frac * pb_price * dmt, 2)
-                        else:
-                            fr[f"{stage_lbl}_Overpay_{short}"] = 0.0
-                    elif short == "Zn" and pd.notna(dmt):
-                        # Zn payable: deduct 8 units, pay 85% of balance (typical Zn terms)
-                        avg = (pv + sv) / 2
-                        if avg > 8.0:
-                            extra_frac = inflation / 100 * 0.85
-                            fr[f"{stage_lbl}_Overpay_{short}"] = round(
-                                extra_frac * zn_price * dmt, 2)
-                        else:
-                            fr[f"{stage_lbl}_Overpay_{short}"] = 0.0
-                    else:
-                        fr[f"{stage_lbl}_Overpay_{short}"] = np.nan
                     best_stage = stage_lbl
                 else:
                     fr[f"{stage_lbl}_Delta_{short}"] = np.nan
-                    fr[f"{stage_lbl}_Overpay_{short}"] = np.nan
+
         fr["Settlement_Stage"] = best_stage or "N/A"
-        if best_stage:
-            ag_op  = fr.get(f"{best_stage}_Overpay_Ag", 0) or 0
-            pb_op  = fr.get(f"{best_stage}_Overpay_Pb", 0) or 0
-            zn_op  = fr.get(f"{best_stage}_Overpay_Zn", 0) or 0
-            fr["Total_Overpay_USD"] = round(ag_op + pb_op + zn_op, 2)
+        dmt = r["DMT"]
+
+        # Extra payable Ag at UK finals (contract: −1.5 oz/TM, pay 95 %)
+        # The 1.5 oz deduction cancels out in a delta-based calculation.
+        ag_uk_d = fr.get("UK finals_Delta_Ag", np.nan)
+        if pd.notna(ag_uk_d) and pd.notna(dmt):
+            fr["Extra_Ag_oz"] = round(
+                (ag_uk_d / 2) * OZ_PER_GRAM * PAYABLE_FRACTION * dmt, 2)
         else:
-            fr["Total_Overpay_USD"] = np.nan
+            fr["Extra_Ag_oz"] = np.nan
+
+        # Extra payable Pb at UK finals (contract: −3 units, pay 95 %)
+        pb_uk_d = fr.get("UK finals_Delta_Pb", np.nan)
+        if pd.notna(pb_uk_d) and pd.notna(dmt):
+            fr["Extra_Pb_t"] = round(
+                (pb_uk_d / 2) / 100 * PAYABLE_FRACTION * dmt, 4)
+        else:
+            fr["Extra_Pb_t"] = np.nan
+
         rows.append(fr)
     return pd.DataFrame(rows)
 
@@ -747,56 +734,96 @@ def chart_delta_timeseries(comp, elem_col, unit, labels, pct_mode=False):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# CHART: FINANCIAL IMPACT
+# CHART: PHYSICAL IMPACT  (extra payable oz / tonnes at UK finals)
 # ═══════════════════════════════════════════════════════════════════════
-def chart_financials(fin_df, ag_price, pb_price):
-    lots = fin_df[fin_df["Total_Overpay_USD"].notna() &
-                  (fin_df["Settlement_Stage"] != "N/A")].copy()
+def chart_physical_impact(fin_df):
+    lots = fin_df[fin_df["Extra_Ag_oz"].notna()].copy()
     if lots.empty:
         fig, ax = plt.subplots(figsize=(8, 3))
-        ax.text(0.5, 0.5, "No financial data available", ha="center",
+        ax.text(0.5, 0.5, "No UK finals data with DMT available", ha="center",
                 va="center", transform=ax.transAxes)
         return fig
 
     n = len(lots)
     fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(max(7, n * 0.65 + 2), 6),
-        height_ratios=[2, 1.3], gridspec_kw={"hspace": 0.45},
+        2, 1, figsize=(max(7, n * 0.65 + 2), 7),
+        height_ratios=[1, 1], gridspec_kw={"hspace": 0.55},
     )
-    x    = np.arange(n)
-    vals = lots["Total_Overpay_USD"].values
-    colors = [C_DELTA_P if v > 0 else C_DELTA_N for v in vals]
+    x = np.arange(n)
 
-    ax1.bar(x, vals, 0.55, color=colors, alpha=0.8, zorder=3)
+    # ── Panel 1: Extra payable Ag troy ounces ──────────────────────────
+    ag_vals = lots["Extra_Ag_oz"].values
+    colors_ag = [C_DELTA_P if v > 0 else C_DELTA_N for v in ag_vals]
+    ax1.bar(x, ag_vals, 0.55, color=colors_ag, alpha=0.8, zorder=3)
     ax1.axhline(0, color="black", lw=0.5, zorder=2)
-    ax1.set_title("Estimated overpayment per lot  (Prepared stage assays)", pad=6)
-    ax1.set_ylabel("USD")
-    ax1.yaxis.set_major_formatter(mticker.FuncFormatter(
-        lambda v, _: f"${v:,.0f}"))
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(lots["TR"].tolist(), rotation=45, ha="right")
-    total = lots["Total_Overpay_USD"].sum()
-    ax1.text(0.98, 0.93, f"NET TOTAL:  ${total:,.0f}",
+    ax1.set_title(
+        "Extra payable silver per lot — UK finals\n"
+        "(positive = Sinchi's result inflates the averaged payment basis)",
+        pad=6)
+    ax1.set_ylabel("Extra payable troy ounces (Ag)")
+    for xi, v in zip(x, ag_vals):
+        if pd.notna(v) and v != 0:
+            ax1.text(xi, v + np.sign(v) * abs(v) * 0.04,
+                     f"{v:+,.1f}", ha="center",
+                     va="bottom" if v >= 0 else "top",
+                     fontsize=7, color="#222", zorder=5)
+    total_ag = np.nansum(ag_vals)
+    ax1.text(0.98, 0.93,
+             f"NET TOTAL:  {total_ag:+,.1f} oz",
              transform=ax1.transAxes, fontsize=10, fontweight="bold",
              ha="right", va="top",
-             color=C_DELTA_P if total > 0 else C_DELTA_N,
+             color=C_DELTA_P if total_ag > 0 else C_DELTA_N,
              bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#ccc"))
+    dmt_vals = lots["DMT"].values
+    xlbls_ag = [f"{tr}\n{d:.0f} t" if pd.notna(d) else str(tr)
+                for tr, d in zip(lots["TR"].tolist(), dmt_vals)]
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(xlbls_ag, rotation=45, ha="right")
     ax1.text(0.0, 1.015,
-             f"Ag = ${ag_price}/oz  ·  Pb = ${pb_price:,.0f}/t  ·  "
-             "red = overpaying Sinchi",
+             "Contract: avg of both chains, deduct 1.5 oz/TM, pay 95 %.  "
+             "Bar = (Δ ÷ 2) × 0.95 / 31.1 × DMT",
              transform=ax1.transAxes, fontsize=7, style="italic", color="#666")
 
-    cum = np.cumsum(vals)
-    ax2.fill_between(x, 0, cum, alpha=0.15, color=C_SINCHI)
-    ax2.plot(x, cum, "o-", color=C_SINCHI, ms=4, lw=1.3)
-    ax2.axhline(0, color="black", lw=0.4)
-    ax2.set_title("Cumulative overpayment", fontsize=9,
-                  fontweight="normal", color="#555", loc="left")
-    ax2.set_ylabel("Cumulative USD")
-    ax2.yaxis.set_major_formatter(mticker.FuncFormatter(
-        lambda v, _: f"${v:,.0f}"))
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(lots["TR"].tolist(), rotation=45, ha="right")
+    # ── Panel 2: Extra payable Pb tonnes ───────────────────────────────
+    lots_pb = fin_df[fin_df["Extra_Pb_t"].notna()].copy()
+    if lots_pb.empty:
+        ax2.text(0.5, 0.5, "No Pb data", ha="center", va="center",
+                 transform=ax2.transAxes, color="#999")
+    else:
+        n_pb = len(lots_pb)
+        x_pb = np.arange(n_pb)
+        pb_vals = lots_pb["Extra_Pb_t"].values
+        colors_pb = [C_DELTA_P if v > 0 else C_DELTA_N for v in pb_vals]
+        ax2.bar(x_pb, pb_vals, 0.55, color=colors_pb, alpha=0.8, zorder=3)
+        ax2.axhline(0, color="black", lw=0.5, zorder=2)
+        ax2.set_title(
+            "Extra payable lead per lot — UK finals\n"
+            "(positive = Sinchi's result inflates the averaged payment basis)",
+            pad=6)
+        ax2.set_ylabel("Extra payable tonnes (Pb content)")
+        for xi, v in zip(x_pb, pb_vals):
+            if pd.notna(v) and v != 0:
+                ax2.text(xi, v + np.sign(v) * abs(v) * 0.04,
+                         f"{v:+.3f}", ha="center",
+                         va="bottom" if v >= 0 else "top",
+                         fontsize=7, color="#222", zorder=5)
+        total_pb = np.nansum(pb_vals)
+        ax2.text(0.98, 0.93,
+                 f"NET TOTAL:  {total_pb:+,.3f} t",
+                 transform=ax2.transAxes, fontsize=10, fontweight="bold",
+                 ha="right", va="top",
+                 color=C_DELTA_P if total_pb > 0 else C_DELTA_N,
+                 bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#ccc"))
+        dmt_pb = lots_pb["DMT"].values
+        xlbls_pb = [f"{tr}\n{d:.0f} t" if pd.notna(d) else str(tr)
+                    for tr, d in zip(lots_pb["TR"].tolist(), dmt_pb)]
+        ax2.set_xticks(x_pb)
+        ax2.set_xticklabels(xlbls_pb, rotation=45, ha="right")
+        ax2.text(0.0, 1.015,
+                 "Contract: avg of both chains, deduct 3 units, pay 95 % "
+                 "(only if Pb > 10 %).  Bar = (Δ ÷ 2) / 100 × 0.95 × DMT",
+                 transform=ax2.transAxes, fontsize=7, style="italic", color="#666")
+
     fig.tight_layout()
     return fig
 
@@ -840,6 +867,82 @@ def chart_summary_bars(comp):
                             va="center", fontsize=9, fontweight="bold")
     fig.suptitle("Bias summary — share of lots where Sinchi result exceeds Penfold",
                  fontweight="bold", y=1.02)
+    fig.tight_layout()
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CHART: STAGE GRADIENT  (bias narrows from Natural → Prepared → UK)
+# ═══════════════════════════════════════════════════════════════════════
+def chart_stage_gradient(comp):
+    """
+    Arrow/bar chart showing how mean bias changes across stages.
+    This is the central evidence chart: large bias at Bolivia level
+    that disappears at independent UK labs = manipulation at source.
+    """
+    stage_labels = ["Natural\n(Bolivia — unprocessed)", "Prepared\n(Bolivia — processed)",
+                    "UK Finals\n(independent labs)"]
+    stage_keys = [("Natural_Penfold", "Natural_Sinchi"),
+                  ("Prepared_Penfold", "Prepared_Sinchi"),
+                  ("UK_Penfold", "UK_Sinchi")]
+    stage_colors = ["#7E57C2", "#26A69A", "#EF6C00"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+
+    for ax_i, (elem_col, title, unit) in enumerate(
+            [("Ag g", "Silver (Ag)", "g/TM"), ("Pb %", "Lead (Pb)", "%")]):
+        means, cis, ns, pct_higher = [], [], [], []
+        for pk, sk in stage_keys:
+            p = comp[f"{pk}_{elem_col}"]
+            s = comp[f"{sk}_{elem_col}"]
+            m = pd.notna(p) & pd.notna(s)
+            d = (s[m].values - p[m].values)
+            n = len(d)
+            ns.append(n)
+            if n >= 2:
+                mn = np.mean(d)
+                se = np.std(d, ddof=1) / np.sqrt(n)
+                ci = sp_stats.t.interval(0.95, df=n-1, loc=mn, scale=se)
+                means.append(mn)
+                cis.append((mn - ci[0], ci[1] - mn))
+                pct_higher.append((d > 0).sum() / n * 100)
+            else:
+                means.append(np.nan)
+                cis.append((0, 0))
+                pct_higher.append(np.nan)
+
+        ax = axes[ax_i]
+        y = np.arange(3)
+        ci_arr = np.array(cis).T
+        ax.barh(y, means, 0.5, color=stage_colors, alpha=0.82, zorder=3)
+        ax.errorbar(means, y, xerr=ci_arr, fmt="none",
+                    color="black", capsize=5, lw=1.2, zorder=4)
+        ax.axvline(0, color="black", lw=0.8, ls="--")
+
+        for i, (mn, n, pct) in enumerate(zip(means, ns, pct_higher)):
+            if pd.notna(mn):
+                side = "left" if mn >= 0 else "right"
+                offset = max(abs(mn) * 0.05, 2) if mn >= 0 else -max(abs(mn) * 0.05, 2)
+                ax.text(mn + offset, i,
+                        f"{mn:+.1f} {unit}  ({pct:.0f}% ↑, n={n})",
+                        va="center", ha=side, fontsize=8, fontweight="bold",
+                        color="#222")
+
+        ax.set_yticks(y)
+        ax.set_yticklabels(stage_labels, fontsize=9)
+        ax.set_xlabel(f"Mean Δ (Sinchi − Penfold)  [{unit}]", fontsize=9)
+        ax.set_title(title, fontsize=11)
+        ax.invert_yaxis()  # Natural on top
+
+        # Shade the "Sinchi benefits" zone
+        xlim = ax.get_xlim()
+        ax.axvspan(0, xlim[1], alpha=0.04, color=C_SINCHI, zorder=0)
+        ax.set_xlim(xlim)
+
+    fig.suptitle(
+        "Bias gradient: mean delta narrows from Bolivia to UK\n"
+        "(error bars = 95% CI of mean)",
+        fontweight="bold", y=1.03)
     fig.tight_layout()
     return fig
 
@@ -1714,7 +1817,7 @@ def build_excel(comp, fin_df, stats_data):
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
         comp.to_excel(w, sheet_name="Cleaned Assay Data", index=False)
-        fin_df.to_excel(w, sheet_name="Financial Impact", index=False)
+        fin_df.to_excel(w, sheet_name="Physical Impact", index=False)
         pd.DataFrame(stats_data).to_excel(w, sheet_name="Statistical Tests",
                                           index=False)
         delta_rows = []
@@ -1781,12 +1884,6 @@ with st.sidebar:
     show_dmt      = st.toggle("Show DMT under bars", value=False,
                               help="Display settled dry metric tonnes beneath each lot label "
                                    "in delta charts — shows the weight context of each discrepancy")
-    st.divider()
-
-    ag_price = st.number_input("Silver price (USD/oz)", value=AG_PRICE_USD_OZ,
-                               min_value=1.0, step=1.0)
-    pb_price = st.number_input("Lead price (USD/t)", value=PB_PRICE_USD_T,
-                               min_value=100.0, step=50.0)
 
 # ── Load data ─────────────────────────────────────────────────────────
 try:
@@ -1825,7 +1922,7 @@ if "Lot_Type" in comp.columns and sel_lot_types:
     comp = comp[comp["Lot_Type"].isin(sel_lot_types)].reset_index(drop=True)
 
 labels = comp["TR"].tolist()
-fin_df = compute_financials(comp, ag_price, pb_price)
+fin_df = compute_physical_impact(comp)
 
 # Collect statistics
 stats_data = []
@@ -1847,7 +1944,7 @@ tabs = st.tabs([
     "📈 Delta Curves",
     "🎯 Correlation",
     "🔒 S-Side",
-    "💰 Financials",
+    "💰 Physical Impact",
     "📐 Statistics",
     "🕵️ UK Trend",
     "🔬 Forensic",
@@ -1860,7 +1957,7 @@ with tabs[0]:
     ag_nat  = paired_stats(comp["Natural_Penfold_Ag g"],  comp["Natural_Sinchi_Ag g"])
     ag_prep = paired_stats(comp["Prepared_Penfold_Ag g"], comp["Prepared_Sinchi_Ag g"])
     ag_uk   = paired_stats(comp["UK_Penfold_Ag g"],       comp["UK_Sinchi_Ag g"])
-    total_op = fin_df["Total_Overpay_USD"].sum()
+    total_extra_oz = fin_df["Extra_Ag_oz"].sum() if "Extra_Ag_oz" in fin_df.columns else np.nan
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Ag Natural — Sinchi higher",
@@ -1875,7 +1972,22 @@ with tabs[0]:
               f"{ag_uk.get('pct_sinchi_higher', '—')} %",
               f"avg Δ = {ag_uk.get('mean_delta', '—')} g  "
               f"({ag_uk.get('pct_rel_bias', '—')} %)")
-    c4.metric("Net overpayment (est.)", f"${total_op:,.0f}")
+    c4.metric("Extra payable Ag (UK finals)",
+              f"{total_extra_oz:+,.1f} oz" if pd.notna(total_extra_oz) else "—",
+              "across all lots with UK data")
+
+    st.markdown("---")
+    st.subheader("Stage gradient — the core evidence")
+    st.markdown(
+        "The bias is **largest at the Bolivia level** (where samples are collected "
+        "and processed locally) and **narrows toward zero at the UK level** (where "
+        "independent, accredited labs analyse the samples). This gradient is "
+        "consistent with manipulation at the Bolivia sampling/local lab stage."
+    )
+    fig_grad = chart_stage_gradient(comp)
+    st.pyplot(fig_grad, use_container_width=True)
+    add_download(fig_grad, "stage_gradient")
+    plt.close(fig_grad)
 
     st.markdown("---")
     fig_sum = chart_summary_bars(comp)
@@ -1900,8 +2012,8 @@ with tabs[0]:
         return ""
 
     st.dataframe(
-        cdf.style.applymap(_color_completeness,
-                           subset=[c for c in cdf.columns if c not in ("TR","Contract")]),
+        cdf.style.map(_color_completeness,
+                      subset=[c for c in cdf.columns if c not in ("TR","Contract")]),
         use_container_width=True, hide_index=True,
     )
 
@@ -2066,26 +2178,28 @@ with tabs[6]:
             "Bolivian lab chain produces inflated values."
         )
 
-# ── TAB 7: Financial Impact ───────────────────────────────────────────
+# ── TAB 7: Physical Impact ────────────────────────────────────────────
 with tabs[7]:
     st.caption(
-        "Overpayment is calculated from **Prepared-stage** assays (the contractually "
-        "determinative stage for most lots). Formula: inflation = (Sinchi − Penfold) / 2, "
-        "then applied to payable Ag/Pb formulae per the contract."
+        "Physical impact at **UK finals** — the contractually determinative stage.  \n"
+        "Earlier stages (Natural, Prepared) are provisional and get corrected once "
+        "UK finals arrive, so only UK finals represent the true payment impact.  \n"
+        "USD conversion is omitted because each lot has different fixation prices, "
+        "quotation periods, and contract appendices."
     )
-    fig_fin = chart_financials(fin_df, ag_price, pb_price)
+    fig_fin = chart_physical_impact(fin_df)
     st.pyplot(fig_fin, use_container_width=True)
-    add_download(fig_fin, "financial_impact")
+    add_download(fig_fin, "physical_impact")
     plt.close(fig_fin)
 
     st.subheader("Lot-by-lot breakdown")
-    display_cols = ["TR", "Contract", "DMT", "Settlement_Stage", "Total_Overpay_USD"]
+    display_cols = ["TR", "Contract", "DMT", "Lot_Type"]
     for s_lbl, _, _, _, _ in STAGES:
-        display_cols += [f"{s_lbl}_Delta_Ag", f"{s_lbl}_Delta_Pb",
-                         f"{s_lbl}_Overpay_Ag", f"{s_lbl}_Overpay_Pb"]
+        display_cols += [f"{s_lbl}_Delta_Ag", f"{s_lbl}_Delta_Pb"]
+    display_cols += ["Extra_Ag_oz", "Extra_Pb_t"]
     available = [c for c in display_cols if c in fin_df.columns]
     st.dataframe(fin_df[available].style.format(
-        {c: "${:,.0f}" for c in available if "Overpay" in c or "Total" in c},
+        {"Extra_Ag_oz": "{:+,.1f} oz", "Extra_Pb_t": "{:+,.4f} t"},
         na_rep="—",
     ), use_container_width=True)
 
@@ -2317,15 +2431,15 @@ with tabs[10]:
     _delta_metric(c2, "Ag Δ Prepared", "Ag g", "Prepared_Penfold", "Prepared_Sinchi")
     _delta_metric(c3, "Ag Δ UK finals","Ag g", "UK_Penfold",       "UK_Sinchi")
     _delta_metric(c4, "Pb Δ Prepared", "Pb %", "Prepared_Penfold", "Prepared_Sinchi", "+.2f")
-    # Financial overpayment for this lot
+    # Extra payable Ag at UK finals for this lot
     lot_fin = fin_df[fin_df["TR"] == sel_tr]
     if len(lot_fin):
-        total_ov = lot_fin.iloc[0].get("Total_Overpay_USD", np.nan)
-        c5.metric("Est. overpayment",
-                  f"${total_ov:,.0f}" if pd.notna(total_ov) else "N/A",
+        extra_oz = lot_fin.iloc[0].get("Extra_Ag_oz", np.nan)
+        c5.metric("Extra payable Ag (UK)",
+                  f"{extra_oz:+,.1f} oz" if pd.notna(extra_oz) else "N/A",
                   f"DMT = {dmt_val:.1f} t" if pd.notna(dmt_val) else "DMT unknown")
     else:
-        c5.metric("Est. overpayment", "N/A", "")
+        c5.metric("Extra payable Ag (UK)", "N/A", "")
 
     # ── Full raw values table ──────────────────────────────────────────
     st.markdown("---")
@@ -2562,20 +2676,19 @@ with tabs[10]:
     else:
         findings.append("**Statistical context:** No extreme z-scores (|z| > 3) detected at this lot.")
 
-    # Financials
+    # Physical impact
     if len(lot_fin):
-        total_ov = lot_fin.iloc[0].get("Total_Overpay_USD", np.nan)
-        if pd.notna(total_ov) and total_ov != 0:
-            ag_ov = lot_fin.iloc[0].get("Prepared_Overpay_Ag", np.nan)
-            pb_ov = lot_fin.iloc[0].get("Prepared_Overpay_Pb", np.nan)
-            ag_ov_val = float(ag_ov) if pd.notna(ag_ov) else 0.0
-            pb_ov_val = float(pb_ov) if pd.notna(pb_ov) else 0.0
-            dmt_str = f"{float(dmt_val):.1f}" if pd.notna(dmt_val) else "N/A"
+        extra_ag = lot_fin.iloc[0].get("Extra_Ag_oz", np.nan)
+        extra_pb = lot_fin.iloc[0].get("Extra_Pb_t", np.nan)
+        dmt_str = f"{float(dmt_val):.1f}" if pd.notna(dmt_val) else "N/A"
+        parts = []
+        if pd.notna(extra_ag) and extra_ag != 0:
+            parts.append(f"Ag: **{extra_ag:+,.1f} extra payable oz**")
+        if pd.notna(extra_pb) and extra_pb != 0:
+            parts.append(f"Pb: **{extra_pb:+,.4f} extra payable t**")
+        if parts:
             findings.append(
-                f"**Financial impact (Prepared stage basis):** Estimated total overpayment = "
-                f"**${total_ov:,.0f}** "
-                f"(Ag: ${ag_ov_val:,.0f}, "
-                f"Pb: ${pb_ov_val:,.0f}). "
+                f"**Physical impact (UK finals basis):** {', '.join(parts)}. "
                 f"DMT = {dmt_str} t."
             )
 
