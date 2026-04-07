@@ -28,6 +28,7 @@ warnings.filterwarnings("ignore", message=".*Glyph.*missing.*")
 
 # Primary assay source — new structured file (Ownership & Stage explicit)
 NEW_FILE_PATH  = r"C:\claude\SMPY\Assay Exchanges - Low Silver Sinchi 1.xlsx"
+NEW_FILE_LOCAL = "Assay Exchanges - Low Silver Sinchi 1.xlsx"   # same-dir copy
 NEW_FILE_SHEET = "Sheet1"
 
 # Original file — used ONLY for DMT weights and S-Side results
@@ -55,6 +56,48 @@ C_BG      = "#FFFFFF"
 ELEMENTS = ["Ag g", "Pb %", "As %", "Sb %", "Sn %", "Bi %", "Zn %"]
 PAYABLES  = ["Ag g", "Pb %"]
 PENALTIES = ["As %", "Sb %", "Sn %", "Bi %"]
+
+# Lab name normalization — applied to BOTH data sources before any logic.
+# Keys are lowercase; values are the canonical name used everywhere.
+LAB_NORM = {
+    # Sinchi natural lab variants
+    "savantaa":       "SavantAA",
+    "savanta":        "SavantAA",
+    "savant":         "SavantAA",
+    "flores-savanta": "SavantAA",
+    # Sinchi prepared lab variants
+    "conde":          "Conde",
+    "conde morales":  "Conde",
+    # Penfold natural lab variants
+    "spectraa":       "SpectrAA",
+    "spectra":        "SpectrAA",
+    # Penfold prepared lab variants
+    "castro":         "Castro",
+    "casto":          "Castro",           # typo in TR67705
+    # UK labs
+    "ahk uk":         "AHK UK",
+    "ahk":            "AHK UK",
+    "asi uk":         "ASI UK",
+    "asi":            "ASI UK",
+    "asa uk":         "ASI UK",           # old name variant
+    "asa":            "ASI UK",           # old name (Alex Stewart Assayers)
+    # Bolivia internal / other
+    "ahk bo":         "AHK_BO",
+    "ahkbo":          "AHK_BO",
+    "ahk pe":         "AHK_PE",
+    "niton":          "Niton",
+    "sgs":            "SGS",
+    "flores":         "Flores",
+}
+
+
+def normalize_lab(lab_value):
+    """Map any lab name variant to its canonical form."""
+    if pd.isna(lab_value):
+        return lab_value
+    key = str(lab_value).strip().lower()
+    return LAB_NORM.get(key, str(lab_value).strip())
+
 
 # Maps new file's Stage value → comp column category prefix
 STAGE_KEY_MAP = {"Natural": "Natural", "Prepared": "Prepared", "UK_Final": "UK"}
@@ -111,13 +154,27 @@ set_chart_style()
 # ═══════════════════════════════════════════════════════════════════════
 # DATA LOADING
 # ═══════════════════════════════════════════════════════════════════════
+def _find_new_file():
+    """Return the assay file path, preferring same-directory copy."""
+    for p in [NEW_FILE_LOCAL, NEW_FILE_PATH]:
+        if Path(p).exists():
+            try:
+                with open(p, "rb") as fh:
+                    fh.read(4)
+                return p
+            except (PermissionError, OSError):
+                continue
+    return None
+
+
 def _find_orig_file():
     """
     Return the first path that both exists AND is readable.
     Tries the local SMPY copy before OneDrive to avoid permission issues
     when OneDrive has the file locked or access is denied.
     """
-    for p in [ORIG_FILE_LOCAL, ORIG_FILE_PATH]:   # local first
+    for p in [ORIG_FILE_LOCAL, "sinchi metals assays over time.xlsx",
+              ORIG_FILE_PATH]:   # local first
         if Path(p).exists():
             try:
                 with open(p, "rb") as fh:
@@ -143,7 +200,13 @@ def load_data(new_file_bytes=None, orig_file_bytes=None):
     if new_file_bytes is not None:
         assay_raw = pd.read_excel(BytesIO(new_file_bytes), sheet_name=NEW_FILE_SHEET)
     else:
-        assay_raw = pd.read_excel(NEW_FILE_PATH, sheet_name=NEW_FILE_SHEET)
+        new_path = _find_new_file()
+        if new_path is None:
+            raise FileNotFoundError(
+                f"Assay file not found. Expected at: {NEW_FILE_PATH}\n"
+                f"Or in the same directory as sinchi_dashboard.py: {NEW_FILE_LOCAL}"
+            )
+        assay_raw = pd.read_excel(new_path, sheet_name=NEW_FILE_SHEET)
 
     assay_df = assay_raw.dropna(subset=["TR_Number"]).copy()
     assay_df = assay_df.rename(columns={
@@ -151,6 +214,9 @@ def load_data(new_file_bytes=None, orig_file_bytes=None):
         "As_pct": "As %", "Sb_pct": "Sb %", "Sn_pct": "Sn %",
         "Bi_pct": "Bi %", "Cu": "Cu %",
     })
+    # Normalize lab names (handles "Conde Morales", "Savanta", "ASA UK", etc.)
+    if "Lab" in assay_df.columns:
+        assay_df["Lab"] = assay_df["Lab"].map(normalize_lab)
     # Category key = "{stage_prefix}_{Ownership}"
     assay_df["_cat"] = assay_df.apply(
         lambda r: f"{STAGE_KEY_MAP.get(r['Stage'], r['Stage'])}_{r['Ownership']}",
@@ -174,7 +240,7 @@ def load_data(new_file_bytes=None, orig_file_bytes=None):
             orig = orig_raw.copy()
             orig["_tr"]   = orig["TR"].astype(str).str.strip()
             orig["_desc"] = orig["Description"].fillna("").str.strip().str.lower()
-            orig["_lab"]  = orig["Lab"].astype(str).str.strip()
+            orig["_lab"]  = orig["Lab"].map(normalize_lab)
 
             # DMT from FINAL-P rows — use LAST row per TR (most recently settled weight)
             fp = orig[orig["_lab"] == "FINAL-P"][["_tr", "DMT"]].dropna(subset=["DMT"])
@@ -987,6 +1053,134 @@ def chart_heatmap(comp, labels, stage_idx=2, pct_mode=False):
                 fmt = f"{v:.1f}" if abs(v) >= 1 else f"{v:.2f}"
                 ax.text(j, i, fmt, ha="center", va="center", fontsize=5.5,
                         color="white" if abs(v) > vmax * 0.55 else "black")
+    fig.tight_layout()
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CHART: COMPACT ALL-STAGES HEATMAP  (Ag & Pb × 3 stages, all lots)
+# ═══════════════════════════════════════════════════════════════════════
+def chart_compact_heatmap(comp, labels):
+    """
+    Compact heatmap: rows = lots, columns = Ag & Pb at each stage.
+    Shows the red pattern at a glance — Sinchi consistently higher at
+    Bolivia level, mixed at UK.
+    """
+    col_defs = [
+        ("Ag\nNatural",  "Natural_Penfold",  "Natural_Sinchi",  "Ag g"),
+        ("Ag\nPrepared", "Prepared_Penfold", "Prepared_Sinchi", "Ag g"),
+        ("Ag\nUK",       "UK_Penfold",       "UK_Sinchi",       "Ag g"),
+        ("Pb\nNatural",  "Natural_Penfold",  "Natural_Sinchi",  "Pb %"),
+        ("Pb\nPrepared", "Prepared_Penfold", "Prepared_Sinchi", "Pb %"),
+        ("Pb\nUK",       "UK_Penfold",       "UK_Sinchi",       "Pb %"),
+    ]
+    n_lots = len(labels)
+    n_cols = len(col_defs)
+    data = np.full((n_lots, n_cols), np.nan)
+
+    for i, (_, row) in enumerate(comp.iterrows()):
+        for j, (_, pk, sk, elem) in enumerate(col_defs):
+            pv = row.get(f"{pk}_{elem}", np.nan)
+            sv = row.get(f"{sk}_{elem}", np.nan)
+            if pd.notna(pv) and pd.notna(sv) and pv != 0:
+                data[i, j] = (sv - pv) / abs(pv) * 100   # always % relative
+
+    fig, ax = plt.subplots(figsize=(8, max(4, n_lots * 0.32 + 1)))
+    vmax = np.nanmax(np.abs(data)) if not np.all(np.isnan(data)) else 1
+    im = ax.imshow(data, aspect="auto", cmap="RdBu_r",
+                   vmin=-vmax, vmax=vmax, interpolation="nearest")
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_xticklabels([c[0] for c in col_defs], fontsize=8)
+    ax.set_yticks(np.arange(n_lots))
+    ax.set_yticklabels(safe_labels(labels), fontsize=7.5)
+
+    # Stage separator lines
+    ax.axvline(2.5, color="black", lw=1.5, alpha=0.4)
+
+    for i in range(n_lots):
+        for j in range(n_cols):
+            v = data[i, j]
+            if pd.notna(v):
+                fmt = f"{v:+.1f}" if abs(v) >= 1 else f"{v:+.2f}"
+                ax.text(j, i, fmt, ha="center", va="center", fontsize=5.5,
+                        color="white" if abs(v) > vmax * 0.5 else "black")
+
+    cb = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.03)
+    cb.set_label("% Δ relative to Penfold", fontsize=8)
+    ax.set_title(
+        "All lots × all stages — % relative delta (Sinchi − Penfold)\n"
+        "Red = Sinchi higher (benefits Sinchi)  ·  Blue = Penfold higher",
+        fontsize=10, pad=8)
+    fig.tight_layout()
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CHART: IMPACT HEATMAP  (delta × DMT for UK finals)
+# ═══════════════════════════════════════════════════════════════════════
+def chart_impact_heatmap(comp, labels):
+    """
+    Heatmap where cell colour = delta × DMT at UK finals.
+    Makes the point: even if most lots are blue (Penfold higher),
+    the few red lots are so large they dominate the total impact.
+    """
+    elems = [("Ag g", "g·t"), ("Pb %", "%·t")]
+    pk_keys = ["UK_Penfold", "UK_Sinchi"]
+    n_lots = len(labels)
+
+    data = np.full((n_lots, len(elems)), np.nan)
+    annot = np.full((n_lots, len(elems)), "", dtype=object)
+
+    for i, (_, row) in enumerate(comp.iterrows()):
+        dmt = row.get("DMT", np.nan)
+        for j, (elem, unit) in enumerate(elems):
+            pv = row.get(f"UK_Penfold_{elem}", np.nan)
+            sv = row.get(f"UK_Sinchi_{elem}", np.nan)
+            if pd.notna(pv) and pd.notna(sv) and pd.notna(dmt):
+                delta = sv - pv
+                impact = delta * float(dmt)
+                data[i, j] = impact
+                annot[i, j] = f"{impact:+,.0f}"
+
+    fig, ax = plt.subplots(figsize=(5, max(4, n_lots * 0.32 + 1)))
+    vmax = np.nanmax(np.abs(data)) if not np.all(np.isnan(data)) else 1
+    im = ax.imshow(data, aspect="auto", cmap="RdBu_r",
+                   vmin=-vmax, vmax=vmax, interpolation="nearest")
+    ax.set_xticks(np.arange(len(elems)))
+    ax.set_xticklabels(["Ag impact\n(g·t)", "Pb impact\n(%·t)"], fontsize=9)
+    ax.set_yticks(np.arange(n_lots))
+
+    # Labels with DMT
+    dmt_vals = comp["DMT"].values if "DMT" in comp.columns else [np.nan]*n_lots
+    ylabels = [f"{lbl}  ({dmt:.0f} t)" if pd.notna(dmt) else lbl
+               for lbl, dmt in zip(labels, dmt_vals)]
+    ax.set_yticklabels(ylabels, fontsize=7.5)
+
+    for i in range(n_lots):
+        for j in range(len(elems)):
+            txt = annot[i, j]
+            if txt:
+                v = data[i, j]
+                text_color = "white" if abs(v) > vmax * 0.45 else "black"
+                ax.text(j, i, txt, ha="center", va="center",
+                        fontsize=7.5, color=text_color, fontweight="bold")
+
+    cb = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.03)
+    cb.set_label("Δ × DMT  (red = Sinchi inflates)", fontsize=8)
+    ax.set_title(
+        "UK finals — impact heatmap (delta × DMT)\n"
+        "Few large red cells dominate even if most are blue",
+        fontsize=10, pad=8)
+
+    # Net totals below
+    ag_total = np.nansum(data[:, 0])
+    pb_total = np.nansum(data[:, 1])
+    ax.text(0.5, -0.08,
+            f"Net Ag: {ag_total:+,.0f} g·t    Net Pb: {pb_total:+,.2f} %·t",
+            transform=ax.transAxes, fontsize=9, ha="center",
+            fontweight="bold",
+            color=C_SINCHI if ag_total > 0 else C_PENFOLD)
+
     fig.tight_layout()
     return fig
 
@@ -1995,7 +2189,19 @@ with tabs[0]:
     add_download(fig_sum, "summary_bars")
     plt.close(fig_sum)
 
-    st.subheader("Delta heatmap — UK finals")
+    st.subheader("Complete delta heatmap — all lots × all stages")
+    st.markdown(
+        "Each cell = % relative delta (Sinchi − Penfold) / |Penfold|.  \n"
+        "**Left half** = Silver (Ag). **Right half** = Lead (Pb).  \n"
+        "The red wall at the Bolivia stages (Natural, Prepared) that turns "
+        "blue/neutral at UK is the smoking gun."
+    )
+    fig_ch = chart_compact_heatmap(comp, labels)
+    st.pyplot(fig_ch, use_container_width=True)
+    add_download(fig_ch, "compact_heatmap_all")
+    plt.close(fig_ch)
+
+    st.subheader("Delta heatmap — UK finals (all elements)")
     fig_hm = chart_heatmap(comp, labels, stage_idx=2, pct_mode=pct_delta)
     st.pyplot(fig_hm, use_container_width=True)
     add_download(fig_hm, "heatmap_uk")
@@ -2711,6 +2917,19 @@ with tabs[11]:
         "(contract averages the two chains). The full value is shown here "
         "so you can compare lots on equal footing."
     )
+
+    st.subheader("Impact heatmap — who benefits at each lot?")
+    st.markdown(
+        "Most lots are blue (Penfold higher at UK), but the **few red lots are "
+        "disproportionately large** — high delta combined with high tonnage. "
+        "The net totals at the bottom show who benefits overall."
+    )
+    fig_ihm = chart_impact_heatmap(comp, labels)
+    st.pyplot(fig_ihm, use_container_width=True)
+    add_download(fig_ihm, "impact_heatmap")
+    plt.close(fig_ihm)
+
+    st.markdown("---")
 
     # Build working table — Pb/Ag lots with UK finals and DMT
     imp = comp[comp["Lot_Type"] == "Pb/Ag"].copy()
