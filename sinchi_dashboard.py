@@ -2066,6 +2066,266 @@ def chart_integrity_verdict_bars(cons):
     return fig
 
 
+# ───── Lot-focused "same sample?" test ─────
+# The question this tool answers directly, one lot at a time:
+#   "For this specific lot, are Penfold's and Sinchi's chains looking at the
+#    same physical mineral — where Sinchi only inflated Ag/Pb — or are they
+#    looking at genuinely different material?"
+#
+# Method: express Sinchi's reading as a percentage of Penfold's reading for
+# every tracked element (100 % = perfect agreement).  Group the result into:
+#   • payable elements  (Ag, Pb) — where Sinchi has a motive to inflate
+#   • neutral + impurity elements (Zn, As, Sb, Sn, Bi) — where they don't
+# If the neutral/impurity elements land close to 100 % while Ag/Pb are far
+# from 100 %, the sample is the same physical material — payable-only
+# manipulation.  If the non-payable elements also drift away from 100 %,
+# the sample itself is different.
+
+LOT_MATCH_TIGHT  = 12.0   # |S/P - 100 %| within this → strong agreement
+LOT_MATCH_LOOSE  = 25.0   # up to this → plausible with sampling noise
+LOT_PAYABLE_HOT  = 5.0    # above this → Sinchi reading is meaningfully inflated
+
+
+def _rel_pct_diff(p, s):
+    """Signed Sinchi-vs-Penfold % difference.  Returns np.nan if undefined."""
+    if pd.isna(p) or pd.isna(s) or p == 0:
+        return np.nan
+    return (s - p) / abs(p) * 100.0
+
+
+def lot_sample_verdict(comp, tr):
+    """Per-lot, per-Bolivia-stage verdict on whether Sinchi and Penfold are
+    looking at the same physical sample.
+
+    Returns a dict with per-stage fields:
+      <stage>_nonpayable_spread_pct  — median |rel diff| over Zn/As/Sb/Sn/Bi
+      <stage>_payable_gap_pct        — median |rel diff| over Ag/Pb
+      <stage>_worst_nonpayable       — (element, rel diff) that drifts most
+      <stage>_verdict                — one of:
+          "Same sample — only payables manipulated"
+          "Same sample — no manipulation evidence"
+          "Mixed — possible partial swap"
+          "Different sample"
+          "Insufficient data"
+    """
+    r = comp[comp["TR"] == tr]
+    if r.empty:
+        return None
+    r = r.iloc[0]
+
+    payable    = ["Ag g", "Pb %"]
+    nonpayable = ["Zn %", "As %", "Sb %", "Sn %", "Bi %"]
+
+    result = {"TR": tr, "Lot_Type": r.get("Lot_Type", "")}
+    for stage_lbl, pk, sk in [("Natural",  "Natural_Penfold",  "Natural_Sinchi"),
+                              ("Prepared", "Prepared_Penfold", "Prepared_Sinchi")]:
+        np_pairs, p_pairs = [], []
+        for e in nonpayable:
+            d = _rel_pct_diff(r.get(f"{pk}_{e}"), r.get(f"{sk}_{e}"))
+            if pd.notna(d):
+                np_pairs.append((e, d))
+        for e in payable:
+            d = _rel_pct_diff(r.get(f"{pk}_{e}"), r.get(f"{sk}_{e}"))
+            if pd.notna(d):
+                p_pairs.append((e, d))
+
+        np_spread = float(np.median([abs(d) for _, d in np_pairs])) if np_pairs else np.nan
+        pay_gap   = float(np.median([abs(d) for _, d in p_pairs]))  if p_pairs  else np.nan
+        worst_np  = max(np_pairs, key=lambda t: abs(t[1])) if np_pairs else (None, np.nan)
+
+        if pd.isna(np_spread) and pd.isna(pay_gap):
+            verdict = "Insufficient data"
+        elif pd.isna(np_spread):
+            verdict = "Insufficient data (no impurity coverage)"
+        elif np_spread <= LOT_MATCH_TIGHT:
+            if pd.notna(pay_gap) and pay_gap > LOT_PAYABLE_HOT:
+                verdict = "Same sample — only payables manipulated"
+            else:
+                verdict = "Same sample — no manipulation evidence"
+        elif np_spread <= LOT_MATCH_LOOSE:
+            if pd.notna(pay_gap) and pay_gap > LOT_PAYABLE_HOT:
+                verdict = "Mixed — possible partial swap"
+            else:
+                verdict = "Mixed — ambiguous"
+        else:
+            verdict = "Different sample"
+
+        result[f"{stage_lbl}_nonpayable_spread_pct"] = round(np_spread, 1) if pd.notna(np_spread) else np.nan
+        result[f"{stage_lbl}_payable_gap_pct"]      = round(pay_gap,   1) if pd.notna(pay_gap)   else np.nan
+        result[f"{stage_lbl}_worst_nonpayable"]     = f"{worst_np[0]} {worst_np[1]:+.1f} %" if worst_np[0] else "—"
+        result[f"{stage_lbl}_verdict"]              = verdict
+    return result
+
+
+def all_lots_sample_verdicts(comp):
+    """Table of every lot with its Natural and Prepared sample-match verdicts."""
+    rows = []
+    for tr in comp["TR"]:
+        v = lot_sample_verdict(comp, tr)
+        if v is not None:
+            rows.append(v)
+    return pd.DataFrame(rows)
+
+
+_VERDICT_COLOR = {
+    "Same sample — only payables manipulated": "#1565C0",
+    "Same sample — no manipulation evidence":  "#2E7D32",
+    "Mixed — possible partial swap":           "#F57C00",
+    "Mixed — ambiguous":                       "#BDB76B",
+    "Different sample":                        "#C62828",
+    "Insufficient data":                       "#BDBDBD",
+    "Insufficient data (no impurity coverage)":"#BDBDBD",
+}
+
+
+def chart_lot_sample_match(comp, tr):
+    """Primary per-lot chart answering 'is this the same physical sample?'.
+
+    For each tracked element, draws a bar = Sinchi's reading as a percentage
+    of Penfold's reading.  100 % (solid reference line) means identical.
+    The green band around 100 % is ±12 % — the match zone.
+
+    Pattern to look for:
+      • Payable bars (Ag, Pb, shown in blue) far from 100 % AND
+      • Non-payable bars (Zn green, impurities purple) near 100 %
+      → same sample, payable-only manipulation (spike).
+
+    If the non-payable bars also drift far from 100 %, the sample itself
+    is different (swap).
+    """
+    r = comp[comp["TR"] == tr]
+    if r.empty:
+        fig, ax = plt.subplots(figsize=(8, 3))
+        ax.text(0.5, 0.5, f"No data for TR{tr}", ha="center", va="center")
+        ax.set_axis_off()
+        return fig
+    r = r.iloc[0]
+
+    elements = [
+        ("Ag g", "Ag",  "#0D47A1"),   # payable
+        ("Pb %", "Pb",  "#0D47A1"),
+        ("Zn %", "Zn",  "#2E7D32"),   # neutral
+        ("As %", "As",  "#6A1B9A"),   # impurities
+        ("Sb %", "Sb",  "#6A1B9A"),
+        ("Sn %", "Sn",  "#6A1B9A"),
+        ("Bi %", "Bi",  "#6A1B9A"),
+    ]
+    stages = [("Natural",  "Natural_Penfold",  "Natural_Sinchi"),
+              ("Prepared", "Prepared_Penfold", "Prepared_Sinchi")]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13.5, 5.2), sharey=True)
+    global_max = 100.0
+    global_min = 100.0
+
+    for ax, (stage_lbl, pk, sk) in zip(axes, stages):
+        ratios, colors, p_vals, s_vals = [], [], [], []
+        for (e, _, c) in elements:
+            p = r.get(f"{pk}_{e}", np.nan)
+            s = r.get(f"{sk}_{e}", np.nan)
+            p_vals.append(p); s_vals.append(s)
+            if pd.notna(p) and pd.notna(s) and p != 0:
+                ratios.append(s / p * 100.0)
+            else:
+                ratios.append(np.nan)
+            colors.append(c)
+        x = np.arange(len(elements))
+        # Perfect-match band ±LOT_MATCH_TIGHT
+        ax.axhspan(100 - LOT_MATCH_TIGHT, 100 + LOT_MATCH_TIGHT,
+                   color="#E8F5E9", alpha=0.7, zorder=0,
+                   label="±12 % match zone")
+        ax.axhspan(100 - LOT_MATCH_LOOSE, 100 - LOT_MATCH_TIGHT,
+                   color="#FFF8E1", alpha=0.6, zorder=0)
+        ax.axhspan(100 + LOT_MATCH_TIGHT, 100 + LOT_MATCH_LOOSE,
+                   color="#FFF8E1", alpha=0.6, zorder=0)
+        ax.axhline(100, color="black", lw=1.1, ls="-", zorder=1)
+
+        bars = ax.bar(x, ratios, color=colors, alpha=0.85,
+                      edgecolor="black", linewidth=0.5, zorder=3)
+        for bar, v, p, s in zip(bars, ratios, p_vals, s_vals):
+            if pd.notna(v):
+                global_max = max(global_max, v)
+                global_min = min(global_min, v)
+                label_top = v >= 100
+                ax.text(bar.get_x() + bar.get_width() / 2,
+                        v + (1.5 if label_top else -1.5),
+                        f"{v:.0f}%",
+                        ha="center", va="bottom" if label_top else "top",
+                        fontsize=9, fontweight="bold", zorder=4)
+                # show raw values small underneath element label
+                ax.annotate(
+                    f"P={p:g}\nS={s:g}",
+                    xy=(bar.get_x() + bar.get_width() / 2, 0),
+                    xycoords=("data", "axes fraction"),
+                    xytext=(0, -22), textcoords="offset points",
+                    ha="center", va="top", fontsize=6.5, color="#555",
+                    annotation_clip=False,
+                )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([lbl for _, lbl, _ in elements],
+                           fontsize=10, fontweight="bold")
+        ax.set_title(f"{stage_lbl} stage", fontsize=11)
+        if stage_lbl == "Natural":
+            ax.set_ylabel("Sinchi reading as % of Penfold  (100 % = identical)")
+            ax.legend(loc="upper right", fontsize=7.5, framealpha=0.92)
+
+    # Symmetric y-range around 100 so readers can compare Natural vs Prepared
+    y_pad = max(15, (global_max - 100) * 1.2, (100 - global_min) * 1.2)
+    for ax in axes:
+        ax.set_ylim(100 - y_pad, 100 + y_pad)
+
+    fig.suptitle(
+        f"TR{tr} — is this the same physical sample?\n"
+        "Blue = payable (Ag, Pb).  Green = neutral (Zn).  Purple = penalty impurities.\n"
+        "Blue far from 100 % + green/purple near 100 % → SAME SAMPLE, payable-only manipulation.",
+        fontweight="bold", y=1.03, fontsize=10.5,
+    )
+    fig.tight_layout()
+    return fig
+
+
+def chart_all_lots_verdict_heatmap(verdict_df):
+    """Compact per-lot verdict overview: one row per lot, two columns
+    (Natural, Prepared), colour-coded by verdict category."""
+    if verdict_df.empty:
+        fig, ax = plt.subplots()
+        ax.text(0.5, 0.5, "No lots", ha="center")
+        return fig
+    stages   = ["Natural", "Prepared"]
+    cat_list = list(_VERDICT_COLOR.keys())
+    cat_idx  = {c: i for i, c in enumerate(cat_list)}
+    data = np.full((len(verdict_df), len(stages)), np.nan)
+    text = np.full((len(verdict_df), len(stages)), "", dtype=object)
+    for i, (_, row) in enumerate(verdict_df.iterrows()):
+        for j, s in enumerate(stages):
+            v = row.get(f"{s}_verdict", "Insufficient data")
+            data[i, j] = cat_idx.get(v, len(cat_list) - 1)
+            text[i, j] = v.split("—")[0].strip() if v else ""
+
+    fig, ax = plt.subplots(figsize=(6.5, max(3.5, 0.32 * len(verdict_df))))
+    from matplotlib.colors import ListedColormap
+    cmap = ListedColormap([_VERDICT_COLOR[c] for c in cat_list])
+    ax.imshow(data, cmap=cmap, vmin=0, vmax=len(cat_list) - 1, aspect="auto")
+    ax.set_xticks(range(len(stages)))
+    ax.set_xticklabels(stages, fontweight="bold")
+    ax.set_yticks(range(len(verdict_df)))
+    ax.set_yticklabels([f"TR{t}" for t in verdict_df["TR"]], fontsize=8)
+    for i in range(len(verdict_df)):
+        for j in range(len(stages)):
+            ax.text(j, i, text[i, j], ha="center", va="center",
+                    fontsize=7.2, color="white", fontweight="bold")
+    ax.set_title("Per-lot sample-integrity verdict", fontsize=10.5,
+                 fontweight="bold")
+    # Legend
+    from matplotlib.patches import Patch
+    handles = [Patch(facecolor=_VERDICT_COLOR[c], edgecolor="black", label=c)
+               for c in cat_list]
+    ax.legend(handles=handles, loc="center left",
+              bbox_to_anchor=(1.02, 0.5), fontsize=7.5, frameon=False)
+    fig.tight_layout()
+    return fig
+
+
 def chart_integrity_ratio_shift(cons):
     """Per-lot bar of ratio shifts that *shouldn't* move under a pure spike.
     Pb/Zn ratio moves if Pb was added but not Zn; As/Sb and Sb/Bi ratios
@@ -2988,89 +3248,122 @@ with tabs[9]:
     )
 
 
-# ── TAB 10: Sample Integrity (spike vs swap) ──────────────────────────
+# ── TAB 10: Sample Integrity — "same sample?" per-lot tool ────────────
 with tabs[10]:
-    st.subheader("Sample integrity — spike vs swap")
+    st.subheader("Sample integrity — did we sample the same material?")
     st.markdown(
-        "Two competing manipulation hypotheses for the Bolivia-stage bias: "
-        "**(A) Spike** — the physical sample is the same mineral Penfold pulled, "
-        "but extra Ag (and possibly Pb) was added before the reading. "
-        "**(B) Swap** — the sample is a physically different material "
-        "(richer stockpile, reconstituted blend). "
-        "They leave different chemical fingerprints, so we can separate them."
-    )
-    st.markdown(
-        "The test uses the **UK-finals stage as a noise baseline**: both chains "
-        "are unbiased there, so UK-stage Δ captures genuine sampling "
-        "heterogeneity. Each Bolivia delta is expressed in multiples of that "
-        "noise (σ). **Zn** is the strongest neutral tracer — it's a major bulk "
-        "element with no payment role, so nobody has a motive to touch it. "
-        "If Zn stays within UK noise while Ag blows past it, the sample was "
-        "spiked. If Zn also jumps, the sample was swapped."
+        "**What this tool answers, one lot at a time:** for a given lot, is "
+        "Sinchi's chain looking at the same physical mineral Penfold pulled "
+        "(and just inflating Ag/Pb on the reading) — or is it a different "
+        "physical sample altogether? "
+        "The test is direct: line up **Sinchi's reading next to Penfold's "
+        "reading for every element**. "
+        "If only the **payable** metals (Ag, Pb) disagree while the "
+        "**non-payable** elements (Zn, As, Sb, Sn, Bi) match closely, the "
+        "sample is the same — the manipulation is on the payable numbers. "
+        "If the non-payable elements also diverge, the sample itself has "
+        "been replaced."
     )
 
-    cons = compute_sample_consistency(comp)
-
-    # Verdict overview
-    st.markdown("#### Verdicts across all lots")
-    fig_vbar = chart_integrity_verdict_bars(cons)
-    st.pyplot(fig_vbar, use_container_width=True)
-    add_download(fig_vbar, "integrity_verdicts")
-    plt.close(fig_vbar)
-
-    # UK baseline table
-    with st.expander("UK-finals noise baseline per element (σ used for scoring)"):
-        st.dataframe(integrity_uk_baseline_table(comp),
-                     use_container_width=True, hide_index=True)
-
-    # Scatter plots for both Bolivia stages
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("#### Natural stage")
-        fig_n = chart_integrity_scatter(cons, stage="Natural")
-        st.pyplot(fig_n, use_container_width=True)
-        add_download(fig_n, "integrity_scatter_natural")
-        plt.close(fig_n)
-    with c2:
-        st.markdown("#### Prepared stage")
-        fig_p = chart_integrity_scatter(cons, stage="Prepared")
-        st.pyplot(fig_p, use_container_width=True)
-        add_download(fig_p, "integrity_scatter_prepared")
-        plt.close(fig_p)
-
-    # Per-lot fingerprint
-    st.markdown("#### Per-lot fingerprint")
-    st.markdown(
-        "Each cell is the excess (in UK-σ units) of the Sinchi−Penfold delta "
-        "for that element. Hot cells on blue (Ag/Pb) only → spike; hot cells "
-        "on green (Zn) too → swap; hot cells on purple (impurities) only → "
-        "targeted penalty understatement."
-    )
+    # ── Per-lot selector ──────────────────────────────────────────────
     default_lot = "93301" if "93301" in labels else (labels[0] if labels else None)
-    if default_lot is not None:
+    if default_lot is None:
+        st.info("No lots available after filtering.")
+    else:
         sel_tr_int = st.selectbox("Select lot", options=labels,
                                   index=labels.index(default_lot),
                                   key="integrity_lot")
-        fig_fp = chart_integrity_fingerprint(cons, sel_tr_int)
-        st.pyplot(fig_fp, use_container_width=True)
-        add_download(fig_fp, f"integrity_fingerprint_{sel_tr_int}")
-        plt.close(fig_fp)
 
-    # Ratio shifts
-    st.markdown("#### Cross-chain ratio shifts")
-    st.markdown(
-        "Ratios that don't involve the payable element *shouldn't* move under "
-        "a pure Ag spike. Large Pb/Zn shifts are consistent with Pb being "
-        "added. Large As/Sb or Sb/Bi shifts suggest the impurity suite itself "
-        "changed (swap signature)."
+        # Verdict card
+        verdict = lot_sample_verdict(comp, sel_tr_int)
+        if verdict is not None:
+            c1, c2 = st.columns(2)
+            for col, stage in [(c1, "Natural"), (c2, "Prepared")]:
+                v  = verdict.get(f"{stage}_verdict", "Insufficient data")
+                np_spread = verdict.get(f"{stage}_nonpayable_spread_pct", np.nan)
+                pay_gap   = verdict.get(f"{stage}_payable_gap_pct", np.nan)
+                worst_np  = verdict.get(f"{stage}_worst_nonpayable", "—")
+                colour = _VERDICT_COLOR.get(v, "#78909C")
+                np_txt = f"{np_spread:.1f} %" if pd.notna(np_spread) else "—"
+                pg_txt = f"{pay_gap:.1f} %"   if pd.notna(pay_gap)   else "—"
+                col.markdown(
+                    f"""<div style='padding:12px;border-radius:6px;
+                        background:{colour};color:white;'>
+                        <div style='font-size:0.85rem;opacity:0.9;'>{stage} stage</div>
+                        <div style='font-size:1.1rem;font-weight:bold;margin-top:4px;'>{v}</div>
+                        <div style='font-size:0.8rem;margin-top:6px;line-height:1.4;'>
+                            Non-payable spread: <b>{np_txt}</b><br>
+                            Payable gap: <b>{pg_txt}</b><br>
+                            Worst non-payable: <b>{worst_np}</b>
+                        </div></div>""",
+                    unsafe_allow_html=True,
+                )
+
+        st.markdown(" ")
+        # Main per-lot chart — the direct visual comparison
+        fig_m = chart_lot_sample_match(comp, sel_tr_int)
+        st.pyplot(fig_m, use_container_width=True)
+        add_download(fig_m, f"sample_match_{sel_tr_int}")
+        plt.close(fig_m)
+
+    st.markdown("---")
+    st.markdown("### All lots at a glance")
+    verdict_df = all_lots_sample_verdicts(comp)
+    fig_hm = chart_all_lots_verdict_heatmap(verdict_df)
+    st.pyplot(fig_hm, use_container_width=False)
+    add_download(fig_hm, "all_lots_verdict")
+    plt.close(fig_hm)
+
+    with st.expander("Full per-lot verdict table"):
+        st.dataframe(verdict_df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("### Supporting diagnostics")
+    st.caption(
+        "The charts below use the UK-finals stage as a within-dataset noise "
+        "baseline (both chains unbiased there) to score how unusual each "
+        "lot's Bolivia-stage delta is in σ-units of that noise. They are a "
+        "statistically stricter view of the same question."
     )
-    fig_rs = chart_integrity_ratio_shift(cons)
-    st.pyplot(fig_rs, use_container_width=True)
-    add_download(fig_rs, "integrity_ratio_shift")
-    plt.close(fig_rs)
+    cons = compute_sample_consistency(comp)
 
-    # Full table
-    with st.expander("Full per-lot × stage integrity table"):
+    with st.expander("Verdict counts (σ-based method)", expanded=False):
+        fig_vbar = chart_integrity_verdict_bars(cons)
+        st.pyplot(fig_vbar, use_container_width=True)
+        add_download(fig_vbar, "integrity_verdicts")
+        plt.close(fig_vbar)
+
+    with st.expander("Ag-excess vs Zn-excess scatter", expanded=False):
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            fig_n = chart_integrity_scatter(cons, stage="Natural")
+            st.pyplot(fig_n, use_container_width=True)
+            add_download(fig_n, "integrity_scatter_natural")
+            plt.close(fig_n)
+        with cc2:
+            fig_p = chart_integrity_scatter(cons, stage="Prepared")
+            st.pyplot(fig_p, use_container_width=True)
+            add_download(fig_p, "integrity_scatter_prepared")
+            plt.close(fig_p)
+
+    with st.expander("Fingerprint heatmap (σ-units of UK noise)", expanded=False):
+        if default_lot is not None:
+            fig_fp = chart_integrity_fingerprint(cons, sel_tr_int)
+            st.pyplot(fig_fp, use_container_width=True)
+            add_download(fig_fp, f"integrity_fingerprint_{sel_tr_int}")
+            plt.close(fig_fp)
+
+    with st.expander("Cross-chain ratio shifts", expanded=False):
+        fig_rs = chart_integrity_ratio_shift(cons)
+        st.pyplot(fig_rs, use_container_width=True)
+        add_download(fig_rs, "integrity_ratio_shift")
+        plt.close(fig_rs)
+
+    with st.expander("UK-finals noise baseline per element", expanded=False):
+        st.dataframe(integrity_uk_baseline_table(comp),
+                     use_container_width=True, hide_index=True)
+
+    with st.expander("Full per-lot × stage σ-based integrity table", expanded=False):
         st.dataframe(cons, use_container_width=True, hide_index=True)
 
 
