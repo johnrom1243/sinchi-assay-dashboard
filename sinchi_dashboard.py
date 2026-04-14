@@ -985,13 +985,30 @@ def chart_stage_gradient(comp):
                     color="black", capsize=5, lw=1.2, zorder=4)
         ax.axvline(0, color="black", lw=0.8, ls="--")
 
+        # Pre-compute where every annotation will sit so we can size the
+        # x-axis correctly.  The label is placed *past the end of the CI
+        # error bar* (not just past the mean) so it never sits on top of
+        # the CI whiskers.
+        ci_upper = [means[i] + cis[i][1] if pd.notna(means[i]) else np.nan
+                    for i in range(3)]
+        ci_lower = [means[i] - cis[i][0] if pd.notna(means[i]) else np.nan
+                    for i in range(3)]
+        # Small constant pad in data units — scales with the widest bar
+        max_mag = max([abs(v) for v in ci_upper + ci_lower if pd.notna(v)]
+                      or [1.0])
+        gap = max(max_mag * 0.03, 0.5)
+
         for i, (mn, n, pct) in enumerate(zip(means, ns, pct_higher)):
             if pd.notna(mn):
-                side = "left" if mn >= 0 else "right"
-                offset = max(abs(mn) * 0.05, 2) if mn >= 0 else -max(abs(mn) * 0.05, 2)
-                ax.text(mn + offset, i,
+                if mn >= 0:
+                    anchor = ci_upper[i] + gap
+                    ha = "left"
+                else:
+                    anchor = ci_lower[i] - gap
+                    ha = "right"
+                ax.text(anchor, i,
                         f"{mn:+.1f} {unit}  ({pct:.0f}% ↑, n={n})",
-                        va="center", ha=side, fontsize=8, fontweight="bold",
+                        va="center", ha=ha, fontsize=8, fontweight="bold",
                         color="#222")
 
         ax.set_yticks(y)
@@ -999,6 +1016,20 @@ def chart_stage_gradient(comp):
         ax.set_xlabel(f"Mean Δ (Sinchi − Penfold)  [{unit}]", fontsize=9)
         ax.set_title(title, fontsize=11)
         ax.invert_yaxis()  # Natural on top
+
+        # Extend x-axis so the annotation text (which starts past the CI
+        # end and runs outward) has enough room to be drawn in full.
+        pos_bounds = [ci_upper[i] for i in range(3)
+                      if pd.notna(means[i]) and means[i] >= 0]
+        neg_bounds = [ci_lower[i] for i in range(3)
+                      if pd.notna(means[i]) and means[i] <  0]
+        max_pos = max(pos_bounds) if pos_bounds else 0
+        min_neg = min(neg_bounds) if neg_bounds else 0
+        # Label text runs ~the same number of data units as the widest bar,
+        # so pad by ~100 % of the largest CI magnitude on the label side.
+        pad_right = max_mag * 1.05 if pos_bounds else max_mag * 0.15
+        pad_left  = max_mag * 1.05 if neg_bounds else max_mag * 0.15
+        ax.set_xlim(min_neg - pad_left, max_pos + pad_right)
 
         # Shade the "Sinchi benefits" zone
         xlim = ax.get_xlim()
@@ -1714,6 +1745,366 @@ def chart_impurities_combined(comp, labels, highlight_benefit=False, pct_mode=Fa
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# SAMPLE-INTEGRITY ANALYSIS — distinguish spike vs swap
+# ═══════════════════════════════════════════════════════════════════════
+# Two competing manipulation hypotheses:
+#
+#   A. SPIKE — Sinchi's Bolivia sample is the same physical mineral as
+#      Penfold's, but had Ag (and maybe Pb) added to the pulp or to the
+#      lab reading.  Signature: the non-payable bulk composition (Zn,
+#      impurities) is unchanged within normal sampling noise.
+#
+#   B. SWAP — Sinchi's Bolivia sample is a physically different material
+#      (richer stockpile, reconstituted blend, different mineralisation).
+#      Signature: Δ on unrelated elements (Zn especially) exceeds normal
+#      sampling noise; the whole geochemical fingerprint has shifted.
+#
+# The UK-finals stage gives a within-dataset baseline for natural sampling
+# heterogeneity, because both chains are unbiased there.  For each Bolivia
+# stage we express deltas as a multiple of UK-baseline σ ("excess"):
+#       excess_e = |Δ_e - median(Δ_e at UK)| / σ_UK(e)
+# Excess < 2 is indistinguishable from normal sampling noise.
+# Excess > 3 means the bulk composition has genuinely shifted.
+#
+# Zn is the strongest neutral tracer — it's a major bulk element
+# (10-20 %), not payable, not penalised, so nobody has a motive to touch
+# it.  If Δ_Zn at Bolivia dwarfs Δ_Zn at UK while Δ_Ag also does, the
+# sample is not the same material.
+# ═══════════════════════════════════════════════════════════════════════
+
+INTEGRITY_NEUTRAL  = ["Zn %"]                             # bulk, no payment role
+INTEGRITY_IMPURITY = ["As %", "Sb %", "Sn %", "Bi %"]     # penalty — motive to understate
+INTEGRITY_PAYABLE  = ["Ag g", "Pb %"]                     # payable — motive to inflate
+INTEGRITY_ALL      = INTEGRITY_PAYABLE + INTEGRITY_NEUTRAL + INTEGRITY_IMPURITY
+
+
+def _robust_baseline(deltas):
+    """Return (median, robust σ) for a 1-D array, using MAD × 1.4826.
+    Falls back to sample stdev if MAD is zero/undefined."""
+    d = np.asarray(deltas, dtype=float)
+    d = d[np.isfinite(d)]
+    if len(d) < 3:
+        return np.nan, np.nan
+    med = float(np.median(d))
+    mad = float(np.median(np.abs(d - med)))
+    sigma = 1.4826 * mad
+    if not np.isfinite(sigma) or sigma == 0:
+        sigma = float(np.std(d, ddof=1)) if len(d) > 1 else np.nan
+    return med, sigma
+
+
+def _integrity_verdict(ag, pb, zn, imp, spike_cut=2.0, swap_cut=3.0):
+    """Decision tree over the four group-level excesses.  Each argument is
+    the number of UK-baseline σ the delta is from zero (or NaN)."""
+    if pd.isna(ag) and pd.isna(pb):
+        return "Insufficient data"
+
+    # A large Zn shift is the clearest swap signature — it overrides the
+    # payable reading since Zn has no manipulation motive of its own.
+    if pd.notna(zn) and zn >= swap_cut:
+        return "Swap"
+
+    payable_high = (pd.notna(ag) and ag >= spike_cut) or (pd.notna(pb) and pb >= spike_cut)
+    if not payable_high:
+        return "Clean"
+
+    zn_ok   = pd.isna(zn)  or zn  < spike_cut
+    zn_mid  = pd.notna(zn) and spike_cut <= zn < swap_cut
+    imp_ok  = pd.isna(imp) or imp < spike_cut
+    imp_mid = pd.notna(imp) and spike_cut <= imp < swap_cut
+
+    if zn_ok and imp_ok:
+        if pd.notna(pb) and pb >= spike_cut:
+            return "Spike (Ag+Pb)"
+        return "Spike (Ag only)"
+    if zn_ok and (not imp_ok) and not imp_mid:
+        return "Spike + impurity hide"
+    if zn_ok and imp_mid:
+        return "Spike + impurity hide"
+    if zn_mid:
+        return "Ambiguous"
+    return "Ambiguous"
+
+
+def compute_sample_consistency(comp, spike_cut=2.0, swap_cut=3.0):
+    """Per-lot × stage table of excess values and a spike/swap verdict.
+
+    Returns one row per (TR, Bolivia stage) with:
+      • d_<elem>         raw Sinchi−Penfold delta at that stage
+      • excess_<elem>    |d - median(d_UK)| / σ_UK  (units of UK-noise σ)
+      • excess_payable   max of Ag/Pb excess
+      • excess_neutral   Zn excess
+      • excess_impurity  mean excess across As/Sb/Sn/Bi
+      • verdict          string label — see _integrity_verdict
+    """
+    # Baselines from UK finals (unbiased on both chains).
+    uk_base = {}
+    for e in INTEGRITY_ALL:
+        p = comp.get(f"UK_Penfold_{e}")
+        s = comp.get(f"UK_Sinchi_{e}")
+        if p is None or s is None:
+            uk_base[e] = (np.nan, np.nan)
+            continue
+        d_uk = (s - p).dropna().values
+        uk_base[e] = _robust_baseline(d_uk)
+
+    rows = []
+    for _, r in comp.iterrows():
+        for stage_lbl, pk, sk, _, _ in STAGES[:2]:     # Natural, Prepared
+            row = {"TR": r["TR"], "Stage": stage_lbl,
+                   "Lot_Type": r.get("Lot_Type", "")}
+
+            excess = {}
+            for e in INTEGRITY_ALL:
+                pv = r.get(f"{pk}_{e}", np.nan)
+                sv = r.get(f"{sk}_{e}", np.nan)
+                if pd.notna(pv) and pd.notna(sv):
+                    d  = sv - pv
+                    row[f"d_{e}"] = round(d, 3)
+                    med, sig = uk_base[e]
+                    if pd.notna(sig) and sig > 0:
+                        excess[e] = abs(d - med) / sig
+                    else:
+                        excess[e] = np.nan
+                else:
+                    row[f"d_{e}"]      = np.nan
+                    excess[e]          = np.nan
+                row[f"excess_{e}"] = round(excess[e], 2) if pd.notna(excess[e]) else np.nan
+
+            # Group aggregates
+            ag_x = excess.get("Ag g", np.nan)
+            pb_x = excess.get("Pb %", np.nan)
+            zn_x = excess.get("Zn %", np.nan)
+            imp_vals = [excess[e] for e in INTEGRITY_IMPURITY if pd.notna(excess.get(e, np.nan))]
+            imp_x = float(np.mean(imp_vals)) if imp_vals else np.nan
+
+            pay_vals = [v for v in [ag_x, pb_x] if pd.notna(v)]
+            row["excess_payable"]  = round(max(pay_vals), 2) if pay_vals else np.nan
+            row["excess_neutral"]  = round(zn_x, 2) if pd.notna(zn_x) else np.nan
+            row["excess_impurity"] = round(imp_x, 2) if pd.notna(imp_x) else np.nan
+
+            # Simple internal-consistency ratios: do ratios that don't
+            # involve Ag/Pb stay the same across the two chains?  A spike
+            # preserves them; a swap generally does not.
+            def _ratio_shift(num, den):
+                pn = r.get(f"{pk}_{num}", np.nan); pd_ = r.get(f"{pk}_{den}", np.nan)
+                sn = r.get(f"{sk}_{num}", np.nan); sd = r.get(f"{sk}_{den}", np.nan)
+                if any(pd.isna(v) for v in [pn, pd_, sn, sd]) or pd_ == 0 or sd == 0:
+                    return np.nan
+                p_ratio = pn / pd_
+                s_ratio = sn / sd
+                return abs(s_ratio - p_ratio) / max(abs(p_ratio), 1e-9) * 100
+            row["pb_zn_ratio_shift_pct"]  = round(_ratio_shift("Pb %", "Zn %"), 1) if pd.notna(_ratio_shift("Pb %", "Zn %")) else np.nan
+            row["as_sb_ratio_shift_pct"]  = round(_ratio_shift("As %", "Sb %"), 1) if pd.notna(_ratio_shift("As %", "Sb %")) else np.nan
+            row["sb_bi_ratio_shift_pct"]  = round(_ratio_shift("Sb %", "Bi %"), 1) if pd.notna(_ratio_shift("Sb %", "Bi %")) else np.nan
+
+            row["verdict"] = _integrity_verdict(ag_x, pb_x, zn_x, imp_x,
+                                                spike_cut, swap_cut)
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def integrity_uk_baseline_table(comp):
+    """Human-readable table of the UK-finals noise baseline per element."""
+    rows = []
+    for e in INTEGRITY_ALL:
+        p = comp.get(f"UK_Penfold_{e}")
+        s = comp.get(f"UK_Sinchi_{e}")
+        if p is None or s is None:
+            continue
+        d = (s - p).dropna().values
+        med, sig = _robust_baseline(d)
+        rows.append({
+            "Element":    e,
+            "n lots":     len(d),
+            "median Δ":   round(med, 3) if pd.notna(med) else np.nan,
+            "σ (robust)": round(sig, 3) if pd.notna(sig) else np.nan,
+            "Group":      ("payable"  if e in INTEGRITY_PAYABLE  else
+                           "neutral"  if e in INTEGRITY_NEUTRAL  else
+                           "impurity"),
+        })
+    return pd.DataFrame(rows)
+
+
+# ───── Sample-integrity charts ─────
+_INTEGRITY_COLORS = {
+    "Spike (Ag only)":        "#1565C0",
+    "Spike (Ag+Pb)":          "#0D47A1",
+    "Spike + impurity hide":  "#6A1B9A",
+    "Swap":                   "#C62828",
+    "Ambiguous":              "#F57C00",
+    "Clean":                  "#78909C",
+    "Insufficient data":      "#BDBDBD",
+}
+
+
+def chart_integrity_scatter(cons, stage="Natural"):
+    """Ag-excess vs Zn-excess scatter for one Bolivia stage.
+    Green band = within UK noise (spike-compatible).
+    Red band   = exceeds UK noise on Zn (swap-compatible)."""
+    sub = cons[cons["Stage"] == stage].copy()
+    sub = sub.dropna(subset=["excess_Ag g", "excess_Zn %"])
+    fig, ax = plt.subplots(figsize=(9, 6))
+    if len(sub) == 0:
+        ax.text(0.5, 0.5, f"No paired Ag+Zn data at {stage} stage",
+                ha="center", va="center", transform=ax.transAxes)
+        return fig
+    y_top = max(float(sub["excess_Zn %"].max()) * 1.2, 5)
+    x_rt  = max(float(sub["excess_Ag g"].max()) * 1.1, 5)
+    ax.axhspan(0, 2, color="#E8F5E9", alpha=0.55, zorder=0)
+    ax.axhspan(3, y_top, color="#FFEBEE", alpha=0.55, zorder=0)
+    ax.axhline(2, color="#2E7D32", ls=":", lw=0.8, zorder=1)
+    ax.axhline(3, color="#C62828", ls=":", lw=0.8, zorder=1)
+    ax.axvline(2, color="grey",    ls="--", lw=0.7, zorder=1)
+
+    for v, grp in sub.groupby("verdict"):
+        ax.scatter(grp["excess_Ag g"], grp["excess_Zn %"],
+                   c=_INTEGRITY_COLORS.get(v, "#78909C"),
+                   s=95, edgecolor="black", linewidth=0.6,
+                   label=f"{v} (n={len(grp)})", zorder=3)
+    for _, r in sub.iterrows():
+        ax.annotate(f"TR{r['TR']}",
+                    (r["excess_Ag g"], r["excess_Zn %"]),
+                    xytext=(4, 4), textcoords="offset points",
+                    fontsize=7, zorder=4)
+    ax.text(0.98, 0.04, "spike zone (Zn within UK noise)",
+            transform=ax.transAxes, ha="right", va="bottom",
+            fontsize=7.5, color="#2E7D32", style="italic")
+    ax.text(0.98, 0.96, "swap zone (Zn shifted beyond UK noise)",
+            transform=ax.transAxes, ha="right", va="top",
+            fontsize=7.5, color="#C62828", style="italic")
+    ax.set_xlabel("Ag excess  (|Δ| / σ at UK finals)")
+    ax.set_ylabel("Zn excess  (|Δ| / σ at UK finals)")
+    ax.set_xlim(0, x_rt)
+    ax.set_ylim(0, y_top)
+    ax.set_title(f"Sample integrity — {stage} stage: spike vs swap")
+    ax.legend(loc="upper left", fontsize=7.5, framealpha=0.92)
+    fig.tight_layout()
+    return fig
+
+
+def chart_integrity_fingerprint(cons, tr):
+    """Per-lot heatmap: rows = Natural/Prepared, cols = all tracked elements,
+    cell value = excess in UK-σ units.  Colour shows where the fingerprint
+    has moved; a row that is hot only on Ag/Pb is a spike, a row hot
+    across Zn too is a swap."""
+    sub = cons[cons["TR"] == tr]
+    stages = ["Natural", "Prepared"]
+    # Order: payables first, then neutral, then impurities (visual grouping)
+    elements = (INTEGRITY_PAYABLE + INTEGRITY_NEUTRAL + INTEGRITY_IMPURITY)
+    data = np.full((len(stages), len(elements)), np.nan)
+    verdicts = {}
+    for i, s in enumerate(stages):
+        rr = sub[sub["Stage"] == s]
+        if rr.empty: continue
+        verdicts[s] = rr["verdict"].iloc[0]
+        for j, e in enumerate(elements):
+            data[i, j] = rr[f"excess_{e}"].iloc[0]
+
+    fig, ax = plt.subplots(figsize=(8.5, 3.0))
+    im = ax.imshow(data, cmap="RdYlGn_r", vmin=0, vmax=6, aspect="auto")
+    ax.set_xticks(range(len(elements)))
+    ax.set_xticklabels(elements, rotation=0, fontsize=9)
+    ax.set_yticks(range(len(stages)))
+    ax.set_yticklabels([f"{s}\n({verdicts.get(s, '—')})" for s in stages],
+                       fontsize=8.5)
+    for i in range(len(stages)):
+        for j in range(len(elements)):
+            v = data[i, j]
+            if pd.notna(v):
+                ax.text(j, i, f"{v:.1f}", ha="center", va="center",
+                        fontsize=9,
+                        color="white" if v > 3 else "black")
+    # Colour x-labels by group
+    for j, e in enumerate(elements):
+        colour = ("#0D47A1" if e in INTEGRITY_PAYABLE else
+                  "#2E7D32" if e in INTEGRITY_NEUTRAL else
+                  "#6A1B9A")
+        ax.get_xticklabels()[j].set_color(colour)
+        ax.get_xticklabels()[j].set_fontweight("bold")
+    cbar = fig.colorbar(im, ax=ax, shrink=0.85)
+    cbar.set_label("Excess  (σ-units of UK noise)")
+    ax.set_title(
+        f"TR{tr} — fingerprint excess by element  "
+        "(blue = payable, green = neutral Zn, purple = penalty impurity)",
+        fontsize=9.5,
+    )
+    fig.tight_layout()
+    return fig
+
+
+def chart_integrity_verdict_bars(cons):
+    """Stacked count of verdicts at Natural vs Prepared — a one-glance view
+    of how many lots fall into each spike/swap category."""
+    order = ["Clean", "Spike (Ag only)", "Spike (Ag+Pb)",
+             "Spike + impurity hide", "Ambiguous", "Swap",
+             "Insufficient data"]
+    stages = ["Natural", "Prepared"]
+    counts = {v: [int(((cons["Stage"] == s) & (cons["verdict"] == v)).sum())
+                  for s in stages] for v in order}
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    bottom = np.zeros(len(stages))
+    for v in order:
+        c = counts[v]
+        if sum(c) == 0:
+            continue
+        ax.bar(stages, c, bottom=bottom,
+               color=_INTEGRITY_COLORS.get(v, "#BDBDBD"),
+               edgecolor="black", linewidth=0.4, label=v)
+        for i, h in enumerate(c):
+            if h > 0:
+                ax.text(i, bottom[i] + h/2, str(h),
+                        ha="center", va="center", fontsize=9,
+                        color="white", fontweight="bold")
+        bottom += np.array(c)
+    ax.set_ylabel("Number of lots")
+    ax.set_title("Sample-integrity verdicts per Bolivia stage")
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
+              fontsize=8, frameon=False)
+    fig.tight_layout()
+    return fig
+
+
+def chart_integrity_ratio_shift(cons):
+    """Per-lot bar of ratio shifts that *shouldn't* move under a pure spike.
+    Pb/Zn ratio moves if Pb was added but not Zn; As/Sb and Sb/Bi ratios
+    move if the underlying impurity suite changed (swap signature)."""
+    stages = ["Natural", "Prepared"]
+    ratios = [("pb_zn_ratio_shift_pct", "Pb/Zn"),
+              ("as_sb_ratio_shift_pct", "As/Sb"),
+              ("sb_bi_ratio_shift_pct", "Sb/Bi")]
+    fig, axes = plt.subplots(len(stages), 1, figsize=(11, 6), sharex=True)
+    if len(stages) == 1:
+        axes = [axes]
+    for ax, stage in zip(axes, stages):
+        sub = cons[cons["Stage"] == stage].copy()
+        lots = sub["TR"].tolist()
+        x = np.arange(len(lots))
+        w = 0.27
+        colors = ["#C62828", "#6A1B9A", "#F57C00"]
+        for i, ((col, lbl), c) in enumerate(zip(ratios, colors)):
+            vals = sub[col].values
+            ax.bar(x + (i-1)*w, vals, w, label=lbl,
+                   color=c, alpha=0.85, edgecolor="black", linewidth=0.3)
+        ax.axhline(0,  color="black", lw=0.5)
+        ax.axhline(25, color="grey",  ls="--", lw=0.6,
+                   label="25 % shift (attention)" if stage == "Natural" else None)
+        ax.set_ylabel(f"{stage}\nratio shift (%)")
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"TR{l}" for l in lots], rotation=45, ha="right",
+                           fontsize=7.5)
+        if stage == "Natural":
+            ax.legend(loc="upper right", fontsize=7.5, ncol=4)
+    fig.suptitle(
+        "Cross-chain ratio shifts — large values indicate the mineral "
+        "composition changed between chains (swap signature)",
+        fontweight="bold", y=1.01)
+    fig.tight_layout()
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # FORENSIC LOT ANALYSIS — CHART FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -2141,6 +2532,7 @@ tabs = st.tabs([
     "💰 Physical Impact",
     "📐 Statistics",
     "🕵️ UK Trend",
+    "🧪 Integrity",
     "🔬 Forensic",
     "⚖️ Impact",
     "📥 Export",
@@ -2596,8 +2988,94 @@ with tabs[9]:
     )
 
 
-# ── TAB 10: Forensic Lot Analysis ─────────────────────────────────────
+# ── TAB 10: Sample Integrity (spike vs swap) ──────────────────────────
 with tabs[10]:
+    st.subheader("Sample integrity — spike vs swap")
+    st.markdown(
+        "Two competing manipulation hypotheses for the Bolivia-stage bias: "
+        "**(A) Spike** — the physical sample is the same mineral Penfold pulled, "
+        "but extra Ag (and possibly Pb) was added before the reading. "
+        "**(B) Swap** — the sample is a physically different material "
+        "(richer stockpile, reconstituted blend). "
+        "They leave different chemical fingerprints, so we can separate them."
+    )
+    st.markdown(
+        "The test uses the **UK-finals stage as a noise baseline**: both chains "
+        "are unbiased there, so UK-stage Δ captures genuine sampling "
+        "heterogeneity. Each Bolivia delta is expressed in multiples of that "
+        "noise (σ). **Zn** is the strongest neutral tracer — it's a major bulk "
+        "element with no payment role, so nobody has a motive to touch it. "
+        "If Zn stays within UK noise while Ag blows past it, the sample was "
+        "spiked. If Zn also jumps, the sample was swapped."
+    )
+
+    cons = compute_sample_consistency(comp)
+
+    # Verdict overview
+    st.markdown("#### Verdicts across all lots")
+    fig_vbar = chart_integrity_verdict_bars(cons)
+    st.pyplot(fig_vbar, use_container_width=True)
+    add_download(fig_vbar, "integrity_verdicts")
+    plt.close(fig_vbar)
+
+    # UK baseline table
+    with st.expander("UK-finals noise baseline per element (σ used for scoring)"):
+        st.dataframe(integrity_uk_baseline_table(comp),
+                     use_container_width=True, hide_index=True)
+
+    # Scatter plots for both Bolivia stages
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("#### Natural stage")
+        fig_n = chart_integrity_scatter(cons, stage="Natural")
+        st.pyplot(fig_n, use_container_width=True)
+        add_download(fig_n, "integrity_scatter_natural")
+        plt.close(fig_n)
+    with c2:
+        st.markdown("#### Prepared stage")
+        fig_p = chart_integrity_scatter(cons, stage="Prepared")
+        st.pyplot(fig_p, use_container_width=True)
+        add_download(fig_p, "integrity_scatter_prepared")
+        plt.close(fig_p)
+
+    # Per-lot fingerprint
+    st.markdown("#### Per-lot fingerprint")
+    st.markdown(
+        "Each cell is the excess (in UK-σ units) of the Sinchi−Penfold delta "
+        "for that element. Hot cells on blue (Ag/Pb) only → spike; hot cells "
+        "on green (Zn) too → swap; hot cells on purple (impurities) only → "
+        "targeted penalty understatement."
+    )
+    default_lot = "93301" if "93301" in labels else (labels[0] if labels else None)
+    if default_lot is not None:
+        sel_tr_int = st.selectbox("Select lot", options=labels,
+                                  index=labels.index(default_lot),
+                                  key="integrity_lot")
+        fig_fp = chart_integrity_fingerprint(cons, sel_tr_int)
+        st.pyplot(fig_fp, use_container_width=True)
+        add_download(fig_fp, f"integrity_fingerprint_{sel_tr_int}")
+        plt.close(fig_fp)
+
+    # Ratio shifts
+    st.markdown("#### Cross-chain ratio shifts")
+    st.markdown(
+        "Ratios that don't involve the payable element *shouldn't* move under "
+        "a pure Ag spike. Large Pb/Zn shifts are consistent with Pb being "
+        "added. Large As/Sb or Sb/Bi shifts suggest the impurity suite itself "
+        "changed (swap signature)."
+    )
+    fig_rs = chart_integrity_ratio_shift(cons)
+    st.pyplot(fig_rs, use_container_width=True)
+    add_download(fig_rs, "integrity_ratio_shift")
+    plt.close(fig_rs)
+
+    # Full table
+    with st.expander("Full per-lot × stage integrity table"):
+        st.dataframe(cons, use_container_width=True, hide_index=True)
+
+
+# ── TAB 11: Forensic Lot Analysis ─────────────────────────────────────
+with tabs[11]:
     st.subheader("Forensic Lot Analysis")
     st.markdown(
         "Deep-dive into a single lot. Every value, every delta, every red flag. "
