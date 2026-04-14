@@ -985,13 +985,30 @@ def chart_stage_gradient(comp):
                     color="black", capsize=5, lw=1.2, zorder=4)
         ax.axvline(0, color="black", lw=0.8, ls="--")
 
+        # Pre-compute where every annotation will sit so we can size the
+        # x-axis correctly.  The label is placed *past the end of the CI
+        # error bar* (not just past the mean) so it never sits on top of
+        # the CI whiskers.
+        ci_upper = [means[i] + cis[i][1] if pd.notna(means[i]) else np.nan
+                    for i in range(3)]
+        ci_lower = [means[i] - cis[i][0] if pd.notna(means[i]) else np.nan
+                    for i in range(3)]
+        # Small constant pad in data units — scales with the widest bar
+        max_mag = max([abs(v) for v in ci_upper + ci_lower if pd.notna(v)]
+                      or [1.0])
+        gap = max(max_mag * 0.03, 0.5)
+
         for i, (mn, n, pct) in enumerate(zip(means, ns, pct_higher)):
             if pd.notna(mn):
-                side = "left" if mn >= 0 else "right"
-                offset = max(abs(mn) * 0.05, 2) if mn >= 0 else -max(abs(mn) * 0.05, 2)
-                ax.text(mn + offset, i,
+                if mn >= 0:
+                    anchor = ci_upper[i] + gap
+                    ha = "left"
+                else:
+                    anchor = ci_lower[i] - gap
+                    ha = "right"
+                ax.text(anchor, i,
                         f"{mn:+.1f} {unit}  ({pct:.0f}% ↑, n={n})",
-                        va="center", ha=side, fontsize=8, fontweight="bold",
+                        va="center", ha=ha, fontsize=8, fontweight="bold",
                         color="#222")
 
         ax.set_yticks(y)
@@ -1000,19 +1017,18 @@ def chart_stage_gradient(comp):
         ax.set_title(title, fontsize=11)
         ax.invert_yaxis()  # Natural on top
 
-        # Extend x-axis so the annotation text (placed just past each bar)
-        # doesn't overlap the bar/CI from the next stage.  The label for a
-        # bar with mean `mn` extends roughly another |mn| * 0.7 to the
-        # outward side, so we pad the axis by the largest such extent.
-        pos_bounds = [means[i] + cis[i][1] for i in range(3)
+        # Extend x-axis so the annotation text (which starts past the CI
+        # end and runs outward) has enough room to be drawn in full.
+        pos_bounds = [ci_upper[i] for i in range(3)
                       if pd.notna(means[i]) and means[i] >= 0]
-        neg_bounds = [means[i] - cis[i][0] for i in range(3)
+        neg_bounds = [ci_lower[i] for i in range(3)
                       if pd.notna(means[i]) and means[i] <  0]
         max_pos = max(pos_bounds) if pos_bounds else 0
         min_neg = min(neg_bounds) if neg_bounds else 0
-        max_mag = max(abs(max_pos), abs(min_neg), 1e-9)
-        pad_right = max_mag * 0.75 if pos_bounds else max_mag * 0.10
-        pad_left  = max_mag * 0.75 if neg_bounds else max_mag * 0.10
+        # Label text runs ~the same number of data units as the widest bar,
+        # so pad by ~100 % of the largest CI magnitude on the label side.
+        pad_right = max_mag * 1.05 if pos_bounds else max_mag * 0.15
+        pad_left  = max_mag * 1.05 if neg_bounds else max_mag * 0.15
         ax.set_xlim(min_neg - pad_left, max_pos + pad_right)
 
         # Shade the "Sinchi benefits" zone
