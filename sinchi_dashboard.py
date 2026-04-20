@@ -2751,7 +2751,18 @@ with st.sidebar:
     st.header("Filters")
     sel_contracts = st.multiselect("Filter by contract (first 3 digits)",
                                    all_contracts, default=all_contracts)
-comp = comp[comp["Contract"].isin(sel_contracts)].reset_index(drop=True)
+
+# Apply contract filter temporarily so the Lot dropdown only shows relevant lots
+temp_comp = comp[comp["Contract"].isin(sel_contracts)]
+
+# Specific Lot (TR) filter
+all_lots = sorted(temp_comp["TR"].unique())
+with st.sidebar:
+    sel_lots = st.multiselect("Filter by specific lot (TR)",
+                              all_lots, default=all_lots)
+
+# Apply both filters to the main dataframe
+comp = temp_comp[temp_comp["TR"].isin(sel_lots)].reset_index(drop=True)
 
 # Lot-type filter — separates Pb/Ag from Zn/Ag concentrates
 all_lot_types = sorted(comp["Lot_Type"].dropna().unique()) if "Lot_Type" in comp.columns else ["Pb/Ag"]
