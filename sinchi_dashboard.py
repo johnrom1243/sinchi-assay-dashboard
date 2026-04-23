@@ -1155,7 +1155,7 @@ def chart_impact_heatmap(comp, labels):
     Makes the point: even if most lots are blue (Penfold higher),
     the few red lots are so large they dominate the total impact.
     """
-    elems = [("Ag g", "g·t"), ("Pb %", "%·t")]
+    elems = [("Ag g", "g·t"), ("Pb %", "t")]
     pk_keys = ["UK_Penfold", "UK_Sinchi"]
     n_lots = len(labels)
 
@@ -1170,15 +1170,22 @@ def chart_impact_heatmap(comp, labels):
             if pd.notna(pv) and pd.notna(sv) and pd.notna(dmt):
                 delta = sv - pv
                 impact = delta * float(dmt)
+                
+                # Convert percent-tonnes to metric tonnes for Lead
+                if elem == "Pb %":
+                    impact = impact / 100
+                    annot[i, j] = f"{impact:+,.1f}"  # Show 1 decimal place for tonnes
+                else:
+                    annot[i, j] = f"{impact:+,.0f}"
+                
                 data[i, j] = impact
-                annot[i, j] = f"{impact:+,.0f}"
 
     fig, ax = plt.subplots(figsize=(5, max(4, n_lots * 0.32 + 1)))
     vmax = np.nanmax(np.abs(data)) if not np.all(np.isnan(data)) else 1
     im = ax.imshow(data, aspect="auto", cmap="RdBu_r",
                    vmin=-vmax, vmax=vmax, interpolation="nearest")
     ax.set_xticks(np.arange(len(elems)))
-    ax.set_xticklabels(["Ag impact\n(g·t)", "Pb impact\n(%·t)"], fontsize=9)
+    ax.set_xticklabels(["Ag impact\n(g·t)", "Pb impact\n(tonnes)"], fontsize=9)
     ax.set_yticks(np.arange(n_lots))
 
     # Labels with DMT
@@ -1207,7 +1214,7 @@ def chart_impact_heatmap(comp, labels):
     ag_total = np.nansum(data[:, 0])
     pb_total = np.nansum(data[:, 1])
     ax.text(0.5, -0.08,
-            f"Net Ag: {ag_total:+,.0f} g·t    Net Pb: {pb_total:+,.2f} %·t",
+            f"Net Ag: {ag_total:+,.0f} g·t    Net Pb: {pb_total:+,.2f} t",
             transform=ax.transAxes, fontsize=9, ha="center",
             fontweight="bold",
             color=C_SINCHI if ag_total > 0 else C_PENFOLD)
@@ -3726,7 +3733,7 @@ with tabs[12]:
 
     # Impact = delta × DMT  (no ÷2)
     imp["ag_impact"] = imp["ag_delta"] * imp["dmt"]
-    imp["pb_impact"] = imp["pb_delta"] * imp["dmt"]
+    imp["pb_impact"] = (imp["pb_delta"] / 100) * imp["dmt"]
 
     imp_valid_ag = imp[imp["ag_impact"].notna()].copy()
     imp_valid_pb = imp[imp["pb_impact"].notna()].copy()
@@ -3802,7 +3809,7 @@ with tabs[12]:
         (ax_ag, imp_valid_ag.sort_values("ag_impact", key=abs, ascending=False),
          "ag_impact", "Impact  (g·t)", "Silver Ag — UK final delta × DMT", "g·t"),
         (ax_pb, imp_valid_pb.sort_values("pb_impact", key=abs, ascending=False),
-         "pb_impact", "Impact  (%·t)", "Lead Pb — UK final delta × DMT", "%·t"),
+         "pb_impact", "Impact  (t)", "Lead Pb — UK final impact (metric tonnes)", "t"),
     ]:
         vals   = df_i[col].values
         xlbls  = df_i["TR"].tolist()
@@ -3864,7 +3871,7 @@ with tabs[12]:
         (ax_c1, imp_chron_ag, "ag_impact",
          "Cumulative g·t", "Silver — cumulative UK impact over time", "g·t"),
         (ax_c2, imp_chron_pb, "pb_impact",
-         "Cumulative %·t", "Lead — cumulative UK impact over time", "%·t"),
+         "Cumulative tonnes", "Lead — cumulative UK impact over time", "t"),
     ]:
         xs   = np.arange(len(df_c))
         vals = df_c[col].values
@@ -3954,8 +3961,8 @@ with tabs[12]:
     tbl = tbl.reindex(tbl["ag_impact"].abs().sort_values(ascending=False).index)
     tbl = tbl.reset_index(drop=True)
     tbl.columns = ["Lot", "DMT (t)", "UK Ag delta (g/TM)", "Ag impact (g·t)",
-                   "UK Pb delta (%)", "Pb impact (%·t)"]
-    for col in ["UK Ag delta (g/TM)", "Ag impact (g·t)", "UK Pb delta (%)", "Pb impact (%·t)"]:
+                   "UK Pb delta (%)", "Pb impact (t)"]
+    for col in ["UK Ag delta (g/TM)", "Ag impact (g·t)", "UK Pb delta (%)", "Pb impact (t)"]:
         tbl[col] = tbl[col].map(lambda v: f"{v:+,.1f}" if pd.notna(v) else "—")
     tbl["DMT (t)"] = tbl["DMT (t)"].map(lambda v: f"{v:.1f}")
     st.dataframe(tbl, use_container_width=True, hide_index=True)
