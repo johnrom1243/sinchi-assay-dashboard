@@ -3685,7 +3685,7 @@ with tabs[11]:
 
 
 # ── TAB 11: Weight-Adjusted Impact ────────────────────────────────────
-with tabs[11]:
+with tabs[12]:
     st.subheader("Weight-Adjusted Impact Analysis — UK Finals")
     st.markdown(
         "Uses only **UK final assays** (the settlement-determining results). "
@@ -3962,7 +3962,7 @@ with tabs[11]:
 
 
 # ── TAB 12: Export ────────────────────────────────────────────────────
-with tabs[12]:
+with tabs[13]:
     st.subheader("Download complete analysis")
     xl_buf = build_excel(comp, fin_df, stats_data)
     st.download_button(
